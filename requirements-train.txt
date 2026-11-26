@@ -1,0 +1,11 @@
+# Training environment (tested in WSL2 Ubuntu, Python 3.12, CUDA 13.0 driver).
+# transformers must be the Inkling-2 PR build (huggingface/transformers PR #51050), pinned to the tested commit:
+torch==2.14.1
+triton==3.8.0
+transformers @ git+https://github.com/huggingface/transformers@6173a2f679ff4ed393afc499aefc569da7e68bc1
+peft==0.22.0
+trl==1.18.2
+accelerate==1.16.0
+bitsandbytes==0.50.2
+datasets==5.2.0
+safetensors
