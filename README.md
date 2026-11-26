@@ -185,7 +185,12 @@ Some checks read sample data from `INKLING_CHECK_DATA` (a JSONL in the training 
 
 ## Credits
 
-- Model: Thinking Machines, Inkling-2-Mini. Use it under its own license.
+- Model: Thinking Machines, Inkling-2-Mini.
 - Inkling-2 support in transformers: huggingface/transformers PR #51050.
 - Inkling-2 support in vLLM: vllm-project/vllm PR #69028.
 - Ampere port of vLLM: Hiutaky/vllm, branch `ampere-port`.
+
+## License
+
+The code in this repository is licensed under the GNU General Public License v3.0 or later; see [LICENSE](LICENSE).
+The Inkling-2-Mini model weights, transformers and vLLM are covered by their own licenses.
