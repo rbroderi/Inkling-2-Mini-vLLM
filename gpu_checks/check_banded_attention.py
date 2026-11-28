@@ -1,4 +1,6 @@
-"""Ticket A1 (docs/inkling_general_speed.md section 10): the banded sliding attention against the original forward on
+"""Check the banded sliding attention against the original forward on real inputs.
+
+Ticket A1 (docs/inkling_general_speed.md section 10): the banded sliding attention against the original forward on
 real inputs of every sliding attention call of the real model (fused experts).
 
 One no-grad forward of a 2,048-token prompt (validation examples concatenated to length) and one of a right-padded
@@ -16,9 +18,7 @@ Whole-model logits are not compared (the model is chaotic at bf16 rounding).
 Run in WSL (takes the GPU lock, needs 21 GiB free):
     cd /path/to/Inkling-2-Mini-vLLM && HF_HUB_OFFLINE=1 PYTHONPATH=. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         ~/inkling-venv/bin/python gpu_checks/check_banded_attention.py
-"""
-
-from __future__ import annotations
+"""  # run as scripts, not a package
 
 import argparse
 import copy
@@ -37,12 +37,13 @@ BARS = {"bf16_rel": 2e-3, "bf16_cos": 0.9999, "fp32_rel": 1e-5, "bf16_grad_rel":
 
 
 def long_token_ids(tok: Any, length: int) -> list[int]:
-    """Validation examples (prompt + completion, chat template) concatenated until ``length`` tokens, truncated."""
-    from inkling_qlora import inkling as ik
-    from inkling_qlora.data import iter_records
+    """Return validation examples (prompt + completion, chat template) joined and cut to ``length`` tokens."""
+    from inkling_qlora import inkling as ik  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora.data import read_records  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     ids: list[int] = []
-    for rec in iter_records(DATA):
+    for ex in read_records(DATA):
+        rec = ex
         prompt = tok.apply_chat_template(
             rec["prompt"], add_generation_prompt=True, tokenize=False, **ik.INKLING_CHAT_TEMPLATE_KWARGS
         )
@@ -50,21 +51,26 @@ def long_token_ids(tok: Any, length: int) -> list[int]:
         ids += tok(text, add_special_tokens=False)["input_ids"]
         if len(ids) >= length:
             return ids[:length]
-    raise ValueError(f"{DATA} has fewer than {length} tokens")
+    msg = f"{DATA} has fewer than {length} tokens"
+    raise ValueError(msg)
 
 
 def rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Return the relative L2 error of ``a`` against ``b``."""
     return ((a.double() - b.double()).norm() / b.double().norm().clamp_min(1e-30)).item()
 
 
 def cos(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Return the cosine similarity of ``a`` and ``b``."""
     a, b = a.double().flatten(), b.double().flatten()
     return (a @ b / (a.norm() * b.norm()).clamp_min(1e-30)).item()
 
 
 def to_device(obj: Any, device: str, memo: dict[int, Any], dtype: torch.dtype | None = None) -> Any:
-    """Copy tensors (in nested dicts) to ``device``; floating tensors to ``dtype`` if given. Shared tensors (the
-    mask, the distance matrix) are copied once."""
+    """Copy tensors (in nested dicts) to ``device``; floating tensors to ``dtype`` if given.
+
+    Shared tensors (the mask, the distance matrix) are copied once.
+    """
     if isinstance(obj, dict):
         return {k: to_device(v, device, memo, dtype) for k, v in obj.items()}
     if not isinstance(obj, torch.Tensor):
@@ -78,6 +84,7 @@ def to_device(obj: Any, device: str, memo: dict[int, Any], dtype: torch.dtype | 
 
 
 def capture(model: torch.nn.Module, modeling: Any, ids: torch.Tensor, mask: torch.Tensor | None) -> list[tuple]:
+    """Run one forward pass and return every sliding attention call's inputs, copied to the CPU."""
     calls: list[tuple] = []
     memo: dict[int, Any] = {}
     handles = []
@@ -99,10 +106,11 @@ def capture(model: torch.nn.Module, modeling: Any, ids: torch.Tensor, mask: torc
 
 
 def grad_inputs(kwargs: dict[str, Any]) -> list[str]:
+    """Return the names of the attention inputs that take a gradient."""
     return [k for k in ("hidden_states", "key_hidden_states", "value_hidden_states") if kwargs.get(k) is not None]
 
 
-def run_pair(module, modeling, ib, kwargs: dict[str, Any], want_grad: bool) -> dict[str, Any]:
+def run_pair(module, modeling, ib, kwargs: dict[str, Any], *, want_grad: bool) -> dict[str, Any]:
     """Original vs patched forward on the same inputs; output (and input gradients if ``want_grad``)."""
     original = modeling.Inkling2LoopSlidingAttention.forward
     assert not ib._use_original(
@@ -126,22 +134,23 @@ def run_pair(module, modeling, ib, kwargs: dict[str, Any], want_grad: bool) -> d
     return out
 
 
-def main() -> None:
+def main() -> None:  # noqa: PLR0915  # check script, one long flow
+    """Compare the banded and original sliding attention on every captured call and print the result."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, help="write the per-call numbers as JSON")
     args = parser.parse_args()
 
-    import transformers.models.inkling2_loop.modeling_inkling2_loop as modeling
-    from transformers import AutoTokenizer
+    import transformers.models.inkling2_loop.modeling_inkling2_loop as modeling  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+    from transformers import AutoTokenizer  # noqa: PLC0415  # heavy GPU dependency, lazy
 
-    from inkling_qlora import inkling as ik
-    from inkling_qlora import inkling_banded as ib
+    from inkling_qlora import inkling as ik  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora import inkling_banded as ib  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     model = ik.load_inkling_4bit(MODEL, device="cuda", experts_impl="fused", mxfp8_storage="nvfp4")
     model.eval()
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok: Any = AutoTokenizer.from_pretrained(MODEL)
     ids = long_token_ids(tok, 2048)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     single = torch.tensor([ids], device="cuda")
@@ -163,7 +172,8 @@ def main() -> None:
     full_attn += [
         m for m in model.modules() if isinstance(m, modeling.Inkling2LoopSlidingAttention) and not m.is_sliding
     ]
-    assert full_attn and all(not hasattr(m, "_banded_original_forward") for m in full_attn), "full attention patched"
+    assert full_attn, "full attention patched"
+    assert all(not hasattr(m, "_banded_original_forward") for m in full_attn), "full attention patched"
     print(f"patched {n} sliding modules; {len(full_attn)} full-attention modules unpatched", flush=True)
 
     rows, failures = [], []
@@ -177,7 +187,7 @@ def main() -> None:
             row: dict[str, Any] = {"case": case, "layer": layer, "call": call}
 
             kw16 = to_device(cpu_kwargs, "cuda", {})
-            r = run_pair(module, modeling, ib, kw16, want_grad)
+            r = run_pair(module, modeling, ib, kw16, want_grad=want_grad)
             row["bf16_rel"] = rel(r["band"][0], r["ref"][0])
             row["bf16_cos"] = cos(r["band"][0], r["ref"][0])
             if want_grad:
@@ -186,7 +196,7 @@ def main() -> None:
 
             module32 = copy.deepcopy(module).float()
             kw32 = to_device(cpu_kwargs, "cuda", {}, dtype=torch.float32)
-            r = run_pair(module32, modeling, ib, kw32, want_grad)
+            r = run_pair(module32, modeling, ib, kw32, want_grad=want_grad)
             row["fp32_rel"] = rel(r["band"][0], r["ref"][0])
             if want_grad:
                 row["fp32_grad_rel"] = max(rel(r["band"][1][k], r["ref"][1][k]) for k in r["ref"][1])

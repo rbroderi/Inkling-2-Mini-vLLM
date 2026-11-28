@@ -1,19 +1,21 @@
-"""Environment probe for the Inkling fused-expert work: versions, Triton tl.dot (bf16, fp32 tf32/ieee) and the
+"""Probe the environment for the Inkling fused-expert work.
+
+Checks versions, Triton tl.dot (bf16, fp32 tf32/ieee) and the
 2-D tl.interleave -> tl.trans -> tl.dot pattern the NVFP4 kernel uses.
 
 Run in WSL: cd /path/to/Inkling-2-Mini-vLLM && PYTHONPATH=. ~/inkling-venv/bin/python gpu_checks/check_env.py
 Exits 75 if the GPU is busy. Uses under 100 MB.
-"""
+"""  # run as scripts, not a package
 
 import torch
-import triton
-import triton.language as tl
+import triton  # pyright: ignore[reportMissingImports]
+import triton.language as tl  # pyright: ignore[reportMissingImports]
 
 from gpu_checks.gpu_guard import gpu_session
 
 
 @triton.jit
-def _dot_kernel(a_ptr, b_ptr, c_ptr, N: tl.constexpr, PRECISION: tl.constexpr):
+def _dot_kernel(a_ptr, b_ptr, c_ptr, N: tl.constexpr, PRECISION: tl.constexpr):  # noqa: N803  # Triton constexpr names
     i = tl.arange(0, N)
     a = tl.load(a_ptr + i[:, None] * N + i[None, :])
     b = tl.load(b_ptr + i[:, None] * N + i[None, :])
@@ -21,7 +23,7 @@ def _dot_kernel(a_ptr, b_ptr, c_ptr, N: tl.constexpr, PRECISION: tl.constexpr):
 
 
 @triton.jit
-def _dot_bf16_kernel(a_ptr, b_ptr, c_ptr, N: tl.constexpr):
+def _dot_bf16_kernel(a_ptr, b_ptr, c_ptr, N: tl.constexpr):  # noqa: N803  # Triton constexpr names
     i = tl.arange(0, N)
     a = tl.load(a_ptr + i[:, None] * N + i[None, :])
     b = tl.load(b_ptr + i[:, None] * N + i[None, :])
@@ -29,7 +31,7 @@ def _dot_bf16_kernel(a_ptr, b_ptr, c_ptr, N: tl.constexpr):
 
 
 @triton.jit
-def _interleave_dot_kernel(x_ptr, a_ptr, c_ptr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _interleave_dot_kernel(x_ptr, a_ptr, c_ptr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):  # noqa: N803, PLR0913, PLR0917  # Triton constexpr names; check helper, many inputs
     """x: uint8 [BN, BK/2] (two codes per byte); out = a[BM, BK] @ interleave(lo, hi)[BN, BK]^T."""
     n = tl.arange(0, BN)
     kh = tl.arange(0, BK // 2)
@@ -47,6 +49,7 @@ def _rel(x: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 def main() -> None:
+    """Print the versions and run the Triton dot and interleave probes."""
     print(f"torch {torch.__version__}, triton {triton.__version__}, CUDA {torch.version.cuda}")
     print(f"device {torch.cuda.get_device_name(0)}, capability {torch.cuda.get_device_capability(0)}")
 
@@ -56,7 +59,7 @@ def main() -> None:
     a = torch.randn(n, n, device="cuda", dtype=torch.bfloat16, generator=g)
     b = torch.randn(n, n, device="cuda", dtype=torch.bfloat16, generator=g)
     c = torch.empty(n, n, device="cuda", dtype=torch.float32)
-    _dot_bf16_kernel[(1,)](a, b, c, N=n)
+    _dot_bf16_kernel[(1,)](a, b, c, N=n)  # pyright: ignore[reportIndexIssue]
     rel = _rel(c, a.double() @ b.double())
     assert rel <= 1e-5, f"bf16 tl.dot rel error {rel}"
     print(f"tl.dot bf16 64x64, fp32 accumulate: passed (rel {rel:.2e})")
@@ -64,9 +67,9 @@ def main() -> None:
     a32 = torch.randn(n, n, device="cuda", dtype=torch.float32, generator=g)
     b32 = torch.randn(n, n, device="cuda", dtype=torch.float32, generator=g)
     ref32 = a32.double() @ b32.double()
-    _dot_kernel[(1,)](a32, b32, c, N=n, PRECISION="tf32")
+    _dot_kernel[(1,)](a32, b32, c, N=n, PRECISION="tf32")  # pyright: ignore[reportIndexIssue]
     print(f"tl.dot fp32 inputs, default input_precision=tf32: rel {_rel(c, ref32):.2e} (informational)")
-    _dot_kernel[(1,)](a32, b32, c, N=n, PRECISION="ieee")
+    _dot_kernel[(1,)](a32, b32, c, N=n, PRECISION="ieee")  # pyright: ignore[reportIndexIssue]
     rel = _rel(c, ref32)
     assert rel <= 1e-5, f"fp32 ieee tl.dot rel error {rel}"
     print(f"tl.dot fp32 inputs, input_precision=ieee: passed (rel {rel:.2e})")
@@ -75,7 +78,7 @@ def main() -> None:
     x = torch.randint(0, 256, (bn, bk // 2), device="cuda", dtype=torch.uint8)
     a = torch.randn(bm, bk, device="cuda", dtype=torch.bfloat16, generator=g)
     c = torch.empty(bm, bn, device="cuda", dtype=torch.float32)
-    _interleave_dot_kernel[(1,)](x, a, c, BM=bm, BN=bn, BK=bk)
+    _interleave_dot_kernel[(1,)](x, a, c, BM=bm, BN=bn, BK=bk)  # pyright: ignore[reportIndexIssue]
     xi = x.to(torch.int32)
     w = torch.stack([xi & 0xF, (xi >> 4) & 0xF], dim=-1).reshape(bn, bk)
     rel = _rel(c, a.double() @ w.double().T)

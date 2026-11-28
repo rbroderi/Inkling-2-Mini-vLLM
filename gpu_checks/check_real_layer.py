@@ -1,4 +1,6 @@
-"""Fused vs loop experts on a real Inkling layer, against an independent fp32 golden path (ticket T5, step 1, of
+"""Compare fused and loop experts on a real Inkling layer against an fp32 golden path.
+
+Fused vs loop experts on a real Inkling layer, against an independent fp32 golden path (ticket T5, step 1, of
 docs/inkling_fused_experts_plan.md).
 
 Run in WSL (takes the GPU lock, needs 8 GiB free, exits 75 if the GPU is busy; peaks under 2 GiB):
@@ -13,11 +15,10 @@ summing to 8 per token, and a random bf16 upstream gradient. Compared for the ou
   fused error <= 1.25 x loop error + 1e-4.
 
 Also checks, on the CPU, that ``SoftcappedSwiGLU`` equals transformers' ``Inkling2LoopSoftcappedSwiGLU`` exactly.
-"""
-
-from __future__ import annotations
+"""  # run as scripts, not a package
 
 import argparse
+from typing import Any
 
 import torch
 
@@ -31,16 +32,19 @@ TOKENS, TOP_K = 750, 8
 
 
 def rel(x: torch.Tensor, ref: torch.Tensor) -> float:
+    """Return the relative L2 error of ``x`` against ``ref``."""
     return ((x.double() - ref.double()).norm() / ref.double().norm()).item()
 
 
 def cosine(x: torch.Tensor, ref: torch.Tensor) -> float:
+    """Return the cosine similarity of ``x`` and ``ref``."""
     x, ref = x.double().flatten(), ref.double().flatten()
     return (x @ ref / (x.norm() * ref.norm())).item()
 
 
 def text_config():
-    from transformers import AutoConfig
+    """Return the model's text config."""
+    from transformers import AutoConfig  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     return AutoConfig.from_pretrained(MODEL).get_text_config()
 
@@ -56,11 +60,13 @@ def load_layer(layer: int, mxfp8_storage: str = "nf4", device: str = "cuda") -> 
         raw = ik.read_layer(snapshot, layer, files, "cpu")
         mod.set_nvfp4_packed(ik.requantize_mxfp8_to_nvfp4(raw, device), device)
     else:
-        raise ValueError(f"layer {layer} is MXFP8; this check needs mxfp8_storage='nvfp4'")
+        msg = f"layer {layer} is MXFP8; this check needs mxfp8_storage='nvfp4'"
+        raise ValueError(msg)
     return mod
 
 
 def make_inputs(mod: ik.Quant4bitExperts, seed: int = 0, device: str = "cuda"):
+    """Build random hidden rows, routing, routing weights and an upstream gradient."""
     g = torch.Generator(device=device).manual_seed(seed)
     hidden = torch.randn(TOKENS, mod.hidden_dim, device=device, generator=g)
     hidden = (hidden / hidden.pow(2).mean(-1, keepdim=True).sqrt()).to(torch.bfloat16)
@@ -71,7 +77,8 @@ def make_inputs(mod: ik.Quant4bitExperts, seed: int = 0, device: str = "cuda"):
     return hidden, top_k_index, weights, grad
 
 
-def run_module(mod: ik.Quant4bitExperts, impl: str, hidden, top_k_index, weights, grad):
+def run_module(mod: ik.Quant4bitExperts, impl: str, hidden, top_k_index, weights, grad):  # noqa: PLR0913, PLR0917  # check helper, many inputs
+    """Run the experts module with implementation ``impl``, forward and backward."""
     mod.impl = impl
     h = hidden.clone().requires_grad_()
     w = weights.clone().requires_grad_()
@@ -80,10 +87,13 @@ def run_module(mod: ik.Quant4bitExperts, impl: str, hidden, top_k_index, weights
     return out.detach(), h.grad, w.grad
 
 
-def golden(mod: ik.Quant4bitExperts, hidden, top_k_index, weights, grad):
-    """Independent fp32 eager loop: each expert's weight decoded to fp32 with the codec (no bf16 rounding), gate/up
-    de-interleaved (even rows = gate), the softcapped SwiGLU written out, fp32 autograd."""
-    from torch.utils.checkpoint import checkpoint
+def golden(mod: Any, hidden, top_k_index, weights, grad):
+    """Run an independent fp32 eager loop as the reference.
+
+    Each expert's weight is decoded to fp32 with the codec (no bf16 rounding), gate/up de-interleaved (even rows =
+    gate), the softcapped SwiGLU written out, fp32 autograd.
+    """
+    from torch.utils.checkpoint import checkpoint  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     def expert(x: torch.Tensor, e: int) -> torch.Tensor:
         gu = dequantize_nvfp4(mod.gate_up_codes[e], mod.gate_up_scale[e], mod.gate_up_factor[e])
@@ -107,7 +117,8 @@ def golden(mod: ik.Quant4bitExperts, hidden, top_k_index, weights, grad):
 
 
 def check_swiglu_cpu() -> None:
-    from transformers.models.inkling2_loop.modeling_inkling2_loop import Inkling2LoopSoftcappedSwiGLU
+    """Check that our softcapped SwiGLU equals the model's own on random bf16 input (CPU)."""
+    from transformers.models.inkling2_loop.modeling_inkling2_loop import Inkling2LoopSoftcappedSwiGLU  # noqa: PLC0415  # heavy GPU dependency, lazy  # pyright: ignore[reportMissingImports]
 
     cfg = text_config()
     ours = SoftcappedSwiGLU(cfg.mlp_gate_softcap, cfg.mlp_up_softcap)
@@ -117,20 +128,6 @@ def check_swiglu_cpu() -> None:
     up = (torch.randn(512, 1152, generator=g) * 30).to(torch.bfloat16)
     assert torch.equal(ours(gate, up), theirs(gate, up)), "SoftcappedSwiGLU differs from Inkling2LoopSoftcappedSwiGLU"
     print("SoftcappedSwiGLU == Inkling2LoopSoftcappedSwiGLU on random bf16 input (CPU, torch.equal)")
-
-
-def check_layer(layer: int, mxfp8_storage: str = "nf4") -> dict[str, float]:
-    """Run the comparison on one layer with synthetic inputs; asserts every bar and returns the measured numbers."""
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    mod = load_layer(layer, mxfp8_storage)
-    inputs = make_inputs(mod)
-    label = f"layer {layer} (storage {mod.storage}, mxfp8_storage={mxfp8_storage}), {TOKENS} tokens x top-{TOP_K}"
-    results, failures = compare(mod, inputs, label)
-    assert not failures, f"layer {layer}: bars failed for {failures}"
-    mod = None
-    torch.cuda.empty_cache()
-    return results
 
 
 def compare(mod: ik.Quant4bitExperts, inputs, label: str) -> tuple[dict[str, float], list[str]]:
@@ -159,13 +156,28 @@ def compare(mod: ik.Quant4bitExperts, inputs, label: str) -> tuple[dict[str, flo
         if not ok:
             failures.append(name)
     print(
-        f"  layer weights {base / 2**30:.2f} GiB; peak above that: fused {p_fused:.2f}, loop {p_loop:.2f} (its autograd "
-        f"saves every used expert's bf16 weights), golden {p_gold:.2f} GiB"
+        f"  layer weights {base / 2**30:.2f} GiB; peak above that: fused {p_fused:.2f}, loop {p_loop:.2f} "
+        f"(its autograd saves every used expert's bf16 weights), golden {p_gold:.2f} GiB"
     )
     return results, failures
 
 
+def check_layer(layer: int, mxfp8_storage: str = "nf4") -> dict[str, float]:
+    """Run the comparison on one layer with synthetic inputs; asserts every bar and returns the measured numbers."""
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    mod = load_layer(layer, mxfp8_storage)
+    inputs = make_inputs(mod)
+    label = f"layer {layer} (storage {mod.storage}, mxfp8_storage={mxfp8_storage}), {TOKENS} tokens x top-{TOP_K}"
+    results, failures = compare(mod, inputs, label)
+    assert not failures, f"layer {layer}: bars failed for {failures}"
+    mod = None
+    torch.cuda.empty_cache()
+    return results
+
+
 def main() -> None:
+    """Compare fused and loop experts on a real layer against the fp32 golden path."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--mxfp8-storage", choices=("nf4", "nvfp4"), default="nf4")

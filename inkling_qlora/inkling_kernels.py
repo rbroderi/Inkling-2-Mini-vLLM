@@ -36,10 +36,11 @@ and the slot scatter into ``gemm`` and made the plan free of host syncs; ticket 
 factors into the gate_up ``gemm`` (``act``, ``save_grads``).
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
+from typing import Protocol
+from typing import no_type_check
+from typing import runtime_checkable
 
 import torch
 from torch import nn
@@ -48,6 +49,7 @@ from torch.autograd.function import once_differentiable
 from inkling_qlora.inkling_nvfp4 import dequantize_nvfp4
 
 _HALF = (torch.bfloat16, torch.float16)
+ACT_CAPS = 2  # ``act`` is (gate_cap, up_cap)
 
 
 def _compute_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -66,18 +68,20 @@ class SoftcappedSwiGLU(nn.Module):
     """``gate_cap*tanh(gate/gate_cap) * sigmoid(gate) * up_cap*tanh(up/up_cap)``, in float32 for half inputs."""
 
     def __init__(self, gate_cap: float, up_cap: float) -> None:
+        """Create the activation with the two softcaps."""
         super().__init__()
         self.gate_cap = float(gate_cap)
         self.up_cap = float(up_cap)
 
     def forward(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """Apply the activation to ``gate`` and ``up``."""
         return _softcapped_swiglu(gate, up, self.gate_cap, self.up_cap)
 
 
 def softcapped_swiglu_grads(
     gate: torch.Tensor, up: torch.Tensor, gate_cap: float, up_cap: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """(d act / d gate, d act / d up), inputs already in the float compute dtype."""
+    """Return (d act / d gate, d act / d up), inputs already in the float compute dtype."""
     tg = torch.tanh(gate / gate_cap)
     s = torch.sigmoid(gate)
     tu = torch.tanh(up / up_cap)
@@ -106,15 +110,19 @@ class RoutePlan:
 
 
 def build_route_plan(top_k_index: torch.Tensor, num_experts: int, block_m: int) -> RoutePlan:
-    """Routing plan for ``top_k_index`` (T, K); the id ``num_experts`` means "no expert" and no block covers it.
+    """Return the routing plan for ``top_k_index`` (T, K); the id ``num_experts`` means "no expert".
+
+    No block covers a "no expert" pair.
 
     Everything stays on the device: no ``int()``, ``.item()``, ``.tolist()``, ``bincount``, ``nonzero`` or
     ``repeat_interleave`` with tensor repeats (each would force a host sync).
     """
     if block_m < 1:
-        raise ValueError(f"block_m must be >= 1, got {block_m}")
+        msg = f"block_m must be >= 1, got {block_m}"
+        raise ValueError(msg)
     if num_experts < 1:
-        raise ValueError(f"num_experts must be >= 1, got {num_experts}")
+        msg = f"num_experts must be >= 1, got {num_experts}"
+        raise ValueError(msg)
     k = top_k_index.shape[-1]
     num_slots = top_k_index.numel()
     device = top_k_index.device
@@ -148,107 +156,17 @@ def build_route_plan(top_k_index: torch.Tensor, num_experts: int, block_m: int) 
     )
 
 
+@runtime_checkable  # beartype checks parameters typed with it
 class ExpertsBackend(Protocol):
+    """What the fused experts need from a GEMM backend (see the module docstring)."""
+
     num_experts: int
 
-    def gemm(
+    def gemm(  # noqa: PLR0913  # keyword options of the backend protocol
         self,
         inp: torch.Tensor,
         proj: str,
-        transpose: bool,
-        plan: RoutePlan,
-        *,
-        in_rows: torch.Tensor | None = None,
-        out_rows: torch.Tensor | None = None,
-        num_out_rows: int | None = None,
-        row_scale: torch.Tensor | None = None,
-        out_dtype: torch.dtype | None = None,
-        round_out: bool = True,
-        act: tuple[float, float] | None = None,
-        save_grads: bool = False,
-    ) -> Any: ...
-
-
-def check_gemm_options(
-    inp: torch.Tensor,
-    plan: RoutePlan,
-    in_rows: torch.Tensor | None,
-    out_rows: torch.Tensor | None,
-    num_out_rows: int | None,
-    row_scale: torch.Tensor | None,
-    out_dtype: torch.dtype | None,
-    act: tuple[float, float] | None = None,
-    save_grads: bool = False,
-    proj: str = "gate_up",
-    transpose: bool = False,
-    round_out: bool = True,
-) -> tuple[torch.dtype, int]:
-    """Validate the ``gemm`` keyword options (shapes and dtypes only, no host sync); returns (out_dtype, out rows)."""
-    num_rows = plan.slot.numel()
-    if act is None:
-        if save_grads:
-            raise ValueError("save_grads needs act")
-    else:
-        if proj != "gate_up" or transpose:
-            raise ValueError(f"act is only valid with proj='gate_up', transpose=False (got {proj!r}, {transpose})")
-        if len(act) != 2:
-            raise ValueError(f"act must be (gate_cap, up_cap), got {act!r}")
-        if out_rows is not None or num_out_rows is not None or row_scale is not None:
-            raise ValueError("act does not combine with out_rows, num_out_rows or row_scale")
-        if out_dtype is not None and out_dtype != inp.dtype:
-            raise TypeError(f"act returns the input dtype ({inp.dtype}); out_dtype {out_dtype} is not allowed")
-        if not round_out:
-            raise ValueError("act rounds gu to the input dtype first; round_out=False is not supported")
-    out_dtype = inp.dtype if out_dtype is None else out_dtype
-    if out_dtype != inp.dtype and not (inp.dtype in _HALF and out_dtype == torch.float32):
-        raise TypeError(f"out_dtype {out_dtype} is not allowed for {inp.dtype} input")
-    if in_rows is None:
-        if inp.shape[0] != num_rows:
-            raise ValueError(f"inp has {inp.shape[0]} rows, the plan has {num_rows} (pass in_rows to gather)")
-    elif in_rows.dtype != torch.int32 or in_rows.shape != (num_rows,):
-        raise ValueError(f"in_rows must be int32 ({num_rows},), got {in_rows.dtype} {tuple(in_rows.shape)}")
-    if out_rows is None:
-        if num_out_rows is not None:
-            raise ValueError("num_out_rows needs out_rows")
-        total = num_rows
-    else:
-        if out_rows.dtype != torch.int32 or out_rows.shape != (num_rows,):
-            raise ValueError(f"out_rows must be int32 ({num_rows},), got {out_rows.dtype} {tuple(out_rows.shape)}")
-        if num_out_rows is None:
-            raise ValueError("out_rows needs num_out_rows")
-        total = num_out_rows
-    if row_scale is not None:
-        if out_dtype in _HALF:
-            raise TypeError("row_scale needs a float32 or float64 output (out_dtype=torch.float32 for half input)")
-        if row_scale.dtype != out_dtype or row_scale.shape != (num_rows,):
-            got = f"{row_scale.dtype} {tuple(row_scale.shape)}"
-            raise ValueError(f"row_scale must be {out_dtype} ({num_rows},), got {got}")
-    return out_dtype, total
-
-
-class TorchBackend:
-    """Reference backend: loops over the experts with rows and dequantizes each one's weight with the codec."""
-
-    def __init__(
-        self,
-        gate_up_codes: torch.Tensor,
-        gate_up_scale: torch.Tensor,
-        gate_up_factor: torch.Tensor,
-        down_codes: torch.Tensor,
-        down_scale: torch.Tensor,
-        down_factor: torch.Tensor,
-    ) -> None:
-        self.weights = {
-            "gate_up": (gate_up_codes, gate_up_scale, gate_up_factor),
-            "down": (down_codes, down_scale, down_factor),
-        }
-        self.num_experts = gate_up_codes.shape[0]
-
-    def gemm(
-        self,
-        inp: torch.Tensor,
-        proj: str,
-        transpose: bool,
+        transpose: bool,  # noqa: FBT001  # callers pass it positionally
         plan: RoutePlan,
         *,
         in_rows: torch.Tensor | None = None,
@@ -260,6 +178,121 @@ class TorchBackend:
         act: tuple[float, float] | None = None,
         save_grads: bool = False,
     ) -> Any:
+        """Run the grouped GEMM for ``proj`` over the plan's rows."""
+        ...
+
+
+def check_gemm_options(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917  # one flat list of option checks
+    inp: torch.Tensor,
+    plan: RoutePlan,
+    in_rows: torch.Tensor | None,
+    out_rows: torch.Tensor | None,
+    num_out_rows: int | None,
+    row_scale: torch.Tensor | None,
+    out_dtype: torch.dtype | None,
+    act: tuple[float, float] | None = None,
+    *,
+    save_grads: bool = False,
+    proj: str = "gate_up",
+    transpose: bool = False,
+    round_out: bool = True,
+) -> tuple[torch.dtype, int]:
+    """Validate the ``gemm`` keyword options (shapes and dtypes only, no host sync).
+
+    Return (out_dtype, out rows).
+    """
+    num_rows = plan.slot.numel()
+    if act is None:
+        if save_grads:
+            msg = "save_grads needs act"
+            raise ValueError(msg)
+    else:
+        if proj != "gate_up" or transpose:
+            msg = f"act is only valid with proj='gate_up', transpose=False (got {proj!r}, {transpose})"
+            raise ValueError(msg)
+        if len(act) != ACT_CAPS:
+            msg = f"act must be (gate_cap, up_cap), got {act!r}"
+            raise ValueError(msg)
+        if out_rows is not None or num_out_rows is not None or row_scale is not None:
+            msg = "act does not combine with out_rows, num_out_rows or row_scale"
+            raise ValueError(msg)
+        if out_dtype is not None and out_dtype != inp.dtype:
+            msg = f"act returns the input dtype ({inp.dtype}); out_dtype {out_dtype} is not allowed"
+            raise TypeError(msg)
+        if not round_out:
+            msg = "act rounds gu to the input dtype first; round_out=False is not supported"
+            raise ValueError(msg)
+    out_dtype = inp.dtype if out_dtype is None else out_dtype
+    if out_dtype != inp.dtype and not (inp.dtype in _HALF and out_dtype == torch.float32):
+        msg = f"out_dtype {out_dtype} is not allowed for {inp.dtype} input"
+        raise TypeError(msg)
+    if in_rows is None:
+        if inp.shape[0] != num_rows:
+            msg = f"inp has {inp.shape[0]} rows, the plan has {num_rows} (pass in_rows to gather)"
+            raise ValueError(msg)
+    elif in_rows.dtype != torch.int32 or in_rows.shape != (num_rows,):
+        msg = f"in_rows must be int32 ({num_rows},), got {in_rows.dtype} {tuple(in_rows.shape)}"
+        raise ValueError(msg)
+    if out_rows is None:
+        if num_out_rows is not None:
+            msg = "num_out_rows needs out_rows"
+            raise ValueError(msg)
+        total = num_rows
+    else:
+        if out_rows.dtype != torch.int32 or out_rows.shape != (num_rows,):
+            msg = f"out_rows must be int32 ({num_rows},), got {out_rows.dtype} {tuple(out_rows.shape)}"
+            raise ValueError(msg)
+        if num_out_rows is None:
+            msg = "out_rows needs num_out_rows"
+            raise ValueError(msg)
+        total = num_out_rows
+    if row_scale is not None:
+        if out_dtype in _HALF:
+            msg = "row_scale needs a float32 or float64 output (out_dtype=torch.float32 for half input)"
+            raise TypeError(msg)
+        if row_scale.dtype != out_dtype or row_scale.shape != (num_rows,):
+            got = f"{row_scale.dtype} {tuple(row_scale.shape)}"
+            msg = f"row_scale must be {out_dtype} ({num_rows},), got {got}"
+            raise ValueError(msg)
+    return out_dtype, total
+
+
+class TorchBackend:
+    """Reference backend: loops over the experts with rows and dequantizes each one's weight with the codec."""
+
+    def __init__(  # noqa: PLR0913, PLR0917  # three tensors per projection, passed positionally
+        self,
+        gate_up_codes: torch.Tensor,
+        gate_up_scale: torch.Tensor,
+        gate_up_factor: torch.Tensor,
+        down_codes: torch.Tensor,
+        down_scale: torch.Tensor,
+        down_factor: torch.Tensor,
+    ) -> None:
+        """Wrap the packed NVFP4 codes, block scales and factors of both projections."""
+        self.weights = {
+            "gate_up": (gate_up_codes, gate_up_scale, gate_up_factor),
+            "down": (down_codes, down_scale, down_factor),
+        }
+        self.num_experts = gate_up_codes.shape[0]
+
+    def gemm(  # noqa: PLR0913  # keyword options of the backend protocol
+        self,
+        inp: torch.Tensor,
+        proj: str,
+        transpose: bool,  # noqa: FBT001  # callers pass it positionally
+        plan: RoutePlan,
+        *,
+        in_rows: torch.Tensor | None = None,
+        out_rows: torch.Tensor | None = None,
+        num_out_rows: int | None = None,
+        row_scale: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+        round_out: bool = True,
+        act: tuple[float, float] | None = None,
+        save_grads: bool = False,
+    ) -> Any:
+        """Run the grouped GEMM expert by expert on the CPU (reference; see the module docstring)."""
         out_dtype, total = check_gemm_options(
             inp,
             plan,
@@ -269,10 +302,10 @@ class TorchBackend:
             row_scale,
             out_dtype,
             act,
-            save_grads,
-            proj,
-            transpose,
-            round_out,
+            save_grads=save_grads,
+            proj=proj,
+            transpose=transpose,
+            round_out=round_out,
         )
         if act is not None:
             gate_cap, up_cap = act
@@ -320,7 +353,7 @@ class TorchBackend:
         return out
 
 
-def _forward(
+def _forward(  # noqa: PLR0913, PLR0917  # shared by the Function and the no-grad path
     hidden: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
@@ -328,9 +361,10 @@ def _forward(
     gate_cap: float,
     up_cap: float,
     block_m: int,
+    *,
     save_grads: bool = False,
 ) -> tuple[torch.Tensor, RoutePlan, torch.Tensor | None, torch.Tensor, torch.Tensor]:
-    """(out, plan, dfac, a, ws), all rows in plan order (T*K rows; rows of sentinel pairs are zero).
+    """Return (out, plan, dfac, a, ws), all rows in plan order (T*K rows; rows of sentinel pairs are zero).
 
     ``dfac`` (TK, 2I) in d: the SwiGLU's (d a / d gate, d a / d up) interleaved, when ``save_grads``; else None.
     """
@@ -340,22 +374,37 @@ def _forward(
     plan = build_route_plan(top_k_index, backend.num_experts, block_m)
     # gate_up GEMM with the SwiGLU epilogue: gu (rounded to d) never leaves the kernel
     a, dfac = backend.gemm(
-        hidden, "gate_up", False, plan, in_rows=plan.token_idx32, act=(gate_cap, up_cap), save_grads=save_grads
+        hidden,
+        "gate_up",
+        transpose=False,
+        plan=plan,
+        in_rows=plan.token_idx32,
+        act=(gate_cap, up_cap),
+        save_grads=save_grads,
     )  # a (TK, I) d; dfac (TK, 2I) d or None
     ws = top_k_weights.reshape(-1).index_select(0, plan.slot).to(f)  # (TK,) f
     # each pair's row: rounded to d, widened, times its routing weight, into its own slot (slots are unique)
     buf = backend.gemm(
-        a, "down", False, plan, out_rows=plan.slot32, num_out_rows=tokens * k, row_scale=ws, out_dtype=f, round_out=True
+        a,
+        "down",
+        transpose=False,
+        plan=plan,
+        out_rows=plan.slot32,
+        num_out_rows=tokens * k,
+        row_scale=ws,
+        out_dtype=f,
+        round_out=True,
     )  # (TK, H) f
     out = buf.view(tokens, k, buf.shape[1]).sum(1).to(d)  # row t*K + k; fixed summation order, no atomics
     return out, plan, dfac, a, ws
 
 
+@no_type_check  # autograd calls forward/backward with its own context objects; keep it unwrapped
 class FusedExpertsFunction(torch.autograd.Function):
     """Experts forward and backward; the frozen expert weights get no gradient."""
 
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(  # type: ignore[override]  # noqa: PLR0913, PLR0917  # autograd Function inputs
         ctx: Any,
         hidden: torch.Tensor,
         top_k_index: torch.Tensor,
@@ -365,6 +414,7 @@ class FusedExpertsFunction(torch.autograd.Function):
         up_cap: float,
         block_m: int,
     ) -> torch.Tensor:
+        """Compute the experts output; keep what the backward needs on ``ctx``."""
         # the derivative factors are needed only for d(hidden)
         out, plan, dfac, a, ws = _forward(
             hidden, top_k_index, top_k_weights, backend, gate_cap, up_cap, block_m, save_grads=ctx.needs_input_grad[0]
@@ -377,7 +427,8 @@ class FusedExpertsFunction(torch.autograd.Function):
 
     @staticmethod
     @once_differentiable
-    def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+    def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor | None, ...]:  # type: ignore[override]  # autograd Function: one grad_out
+        """Return the gradients for the hidden states and the routing weights; the experts are frozen."""
         plan: RoutePlan = ctx.plan
         backend = ctx.backend
         shape, d = ctx.hidden_meta
@@ -389,7 +440,9 @@ class FusedExpertsFunction(torch.autograd.Function):
         dfac, a, ws = ctx.saved_tensors
         go = grad_out.to(d).contiguous()  # (T, H)
         # W_down^T go for every pair, unscaled and unrounded; zero on sentinel rows
-        da_u = backend.gemm(go, "down", True, plan, in_rows=plan.token_idx32, out_dtype=f, round_out=False)  # (TK, I)
+        da_u = backend.gemm(
+            go, "down", transpose=True, plan=plan, in_rows=plan.token_idx32, out_dtype=f, round_out=False
+        )  # (TK, I)
         if need_weights:
             # sum_h go[h] (W a)[h] = sum_i (W^T go)[i] a[i], with the bf16 a the down projection saw
             dws = (da_u * a.to(f)).sum(-1)
@@ -401,13 +454,20 @@ class FusedExpertsFunction(torch.autograd.Function):
             dfac2 = dfac.view(num_rows, inter, 2).to(f)  # [..., 0] = d a / d gate, [..., 1] = d a / d up
             dgu = (da[:, :, None] * dfac2).reshape(num_rows, 2 * inter).to(d)  # even = gate
             buf = backend.gemm(
-                dgu, "gate_up", True, plan, out_rows=plan.slot32, num_out_rows=tokens * k, out_dtype=f, round_out=True
+                dgu,
+                "gate_up",
+                transpose=True,
+                plan=plan,
+                out_rows=plan.slot32,
+                num_out_rows=tokens * k,
+                out_dtype=f,
+                round_out=True,
             )  # (TK, H) f
             d_hidden = buf.view(tokens, k, buf.shape[1]).sum(1).to(d).view(shape)
         return d_hidden, None, d_weights, None, None, None, None
 
 
-def fused_experts(
+def fused_experts(  # noqa: PLR0913, PLR0917  # public API; callers pass the caps positionally
     hidden: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
@@ -416,7 +476,7 @@ def fused_experts(
     up_cap: float,
     block_m: int = 64,
 ) -> torch.Tensor:
-    """Experts output (T, H) in ``hidden.dtype``; the autograd Function only when a gradient can be needed."""
+    """Return the experts output (T, H) in ``hidden.dtype``; use the autograd Function only if a gradient is needed."""
     if not torch.is_grad_enabled() or not (hidden.requires_grad or top_k_weights.requires_grad):
         with torch.no_grad():
             return _forward(hidden, top_k_index, top_k_weights, backend, gate_cap, up_cap, block_m)[0]

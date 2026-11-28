@@ -1,24 +1,25 @@
-"""Ticket A1 (docs/inkling_general_speed.md section 10): the banded sliding attention patch on a tiny random
+"""Check the banded sliding attention patch on a tiny random Inkling model, on the CPU.
+
+Ticket A1 (docs/inkling_general_speed.md section 10): the banded sliding attention patch on a tiny random
 ``Inkling2LoopForConditionalGeneration``, on the CPU (no GPU, no lock). Needs the Inkling transformers build.
 
 Checks, float32: logits and the gradient of a scalar loss with respect to every parameter, patched vs unpatched, for
 T = 50 and for a padded batch of two (one left-, one right-padded), rel <= 1e-4, with the query chunk at 5, 16 and the
-default; ``enable`` returns the number of sliding layers; T = 16 (= the window), cached calls, output_attentions (kwarg or config) and hooks on
-``relative_position_bias`` take the fallback
+default; ``enable`` returns the number of sliding layers; T = 16 (= the window), cached calls, output_attentions
+(kwarg or config) and hooks on ``relative_position_bias`` take the fallback
 (counted by wrapping the original forward), T = 50 never does; ``disable`` restores bit-identical outputs; a wrong
 pinned hash for any of the pinned functions raises RuntimeError.
 
 Run in WSL:
     cd /path/to/Inkling-2-Mini-vLLM && PYTHONPATH=. ~/inkling-venv/bin/python gpu_checks/check_banded_model.py
-"""
-
-from __future__ import annotations
+"""  # run as scripts, not a package
 
 import sys
+from typing import Any
 
 import torch
-import transformers.models.inkling2_loop.modeling_inkling2_loop as modeling
-from transformers.models.inkling2_loop.configuration_inkling2_loop import Inkling2LoopConfig
+import transformers.models.inkling2_loop.modeling_inkling2_loop as modeling  # pyright: ignore[reportMissingImports]
+from transformers.models.inkling2_loop.configuration_inkling2_loop import Inkling2LoopConfig  # pyright: ignore[reportMissingImports]
 
 from inkling_qlora import inkling_banded as ib
 
@@ -27,48 +28,50 @@ VOCAB = 128
 FAILURES: list[str] = []
 
 
-def check(ok: bool, what: str) -> None:
+def check(ok: bool, what: str) -> None:  # noqa: FBT001  # the condition is the first positional argument at every call
+    """Print an ok or FAIL line for ``what`` and record a failure."""
     print(f"{'ok  ' if ok else 'FAIL'} {what}", flush=True)
     if not ok:
         FAILURES.append(what)
 
 
 def tiny_model() -> torch.nn.Module:
+    """Build a tiny random Inkling model for the CPU checks."""
     config = Inkling2LoopConfig(
-        text_config=dict(
-            vocab_size=VOCAB,
-            unpadded_vocab_size=VOCAB,
-            hidden_size=32,
-            num_hidden_layers=6,  # layers 0-4 sliding, 5 full; 2-3 are loop layers run twice
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            swa_num_attention_heads=6,
-            swa_num_key_value_heads=2,
-            swa_head_dim=8,
-            sliding_window_size=WINDOW,
-            d_rel=4,
-            rel_extent=32,
-            moe_intermediate_size=16,
-            n_routed_experts=4,
-            num_experts_per_tok=2,
-            n_layers_per_attn_res_block=2,
-            loop_layer_index_start=2,
-            loop_layer_index_end=4,
-            loop_num_passes=2,
-            loop_gate_rank=4,
-            pad_token_id=0,
-            eos_token_id=1,
-        ),
-        vision_config=dict(
-            model_type="inkling2_vision",
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            projection_hidden_dim=32,
-            text_hidden_size=32,
-        ),
+        text_config={
+            "vocab_size": VOCAB,
+            "unpadded_vocab_size": VOCAB,
+            "hidden_size": 32,
+            "num_hidden_layers": 6,  # layers 0-4 sliding, 5 full; 2-3 are loop layers run twice
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "swa_num_attention_heads": 6,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 8,
+            "sliding_window_size": WINDOW,
+            "d_rel": 4,
+            "rel_extent": 32,
+            "moe_intermediate_size": 16,
+            "n_routed_experts": 4,
+            "num_experts_per_tok": 2,
+            "n_layers_per_attn_res_block": 2,
+            "loop_layer_index_start": 2,
+            "loop_layer_index_end": 4,
+            "loop_num_passes": 2,
+            "loop_gate_rank": 4,
+            "pad_token_id": 0,
+            "eos_token_id": 1,
+        },
+        vision_config={
+            "model_type": "inkling2_vision",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "projection_hidden_dim": 32,
+            "text_hidden_size": 32,
+        },
     )
     config._attn_implementation = "eager"
     torch.manual_seed(0)
@@ -80,10 +83,12 @@ def tiny_model() -> torch.nn.Module:
 
 
 def rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Return the relative L2 error of ``a`` against ``b``."""
     return ((a - b).double().norm() / b.double().norm().clamp_min(1e-30)).item()
 
 
 def run(model, ids, mask, weights) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Run a forward and backward pass and return the logits and the gradient of every parameter."""
     model.zero_grad(set_to_none=True)
     logits = model(input_ids=ids, attention_mask=mask, use_cache=False).logits
     loss = (logits * weights).sum()
@@ -93,11 +98,12 @@ def run(model, ids, mask, weights) -> tuple[torch.Tensor, dict[str, torch.Tensor
 
 
 def compare_case(model, name: str, ids, mask) -> None:
+    """Compare logits and gradients of the patched and unpatched model on one input."""
     weights = torch.randn(*ids.shape, VOCAB, generator=torch.Generator().manual_seed(1))
     ib.disable_banded_attention(model)
     ref_logits, ref_grads = run(model, ids, mask, weights)
     for chunk in (5, 16, ib.BAND_CHUNK):
-        original_chunk, ib.BAND_CHUNK = ib.BAND_CHUNK, chunk
+        original_chunk, ib.BAND_CHUNK = ib.BAND_CHUNK, chunk  # pyrefly: ignore[bad-assignment]
         try:
             ib.enable_banded_attention(model)
             logits, grads = run(model, ids, mask, weights)
@@ -115,6 +121,7 @@ def compare_case(model, name: str, ids, mask) -> None:
 
 
 def count_fallbacks(model) -> list[int]:
+    """Wrap each sliding attention's original forward to count fallback calls; return the counter."""
     counter = [0]
     for module in model.modules():
         if hasattr(module, "_banded_original_forward"):
@@ -128,8 +135,9 @@ def count_fallbacks(model) -> list[int]:
     return counter
 
 
-def main() -> None:
-    model = tiny_model()
+def main() -> None:  # noqa: PLR0915  # check script, one long flow
+    """Run every banded-attention check on the tiny model."""
+    model: Any = tiny_model()
     model.train()
     sliding = [m for m in model.modules() if isinstance(m, modeling.Inkling2LoopSlidingAttention) and m.is_sliding]
     full_attn = [
@@ -201,7 +209,7 @@ def main() -> None:
         ib.PINNED_SOURCE_SHA256[name] = "0" * 64
         try:
             ib.enable_banded_attention(model)
-            check(False, f"a wrong pinned hash for {name} raises")
+            check(ok=False, what=f"a wrong pinned hash for {name} raises")
         except RuntimeError as exc:
             check(f"source of {name} changed" in str(exc), f"a wrong pinned hash for {name} raises")
         finally:

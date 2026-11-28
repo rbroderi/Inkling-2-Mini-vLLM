@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
+from safetensors.torch import save_file
 
 _spec = importlib.util.spec_from_file_location(
     "merge_adapters_cat", Path(__file__).resolve().parents[1] / "scripts" / "merge_adapters_cat.py"

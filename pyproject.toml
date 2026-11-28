@@ -1,32 +1,49 @@
 [project]
 name = "inkling-qlora"
-version = "0.1.0"
+version = "0.2.0"
 description = "QLoRA training and vLLM serving of Inkling-2-Mini on one 24 GB Ampere GPU (RTX 3090)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"  # the code relies on deferred annotations (PEP 649)
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
-dependencies = ["torch", "safetensors"]
+dependencies = [
+    "beartype>=0.23.1",  # runtime type checks for the package (see inkling_qlora/__init__.py)
+    "torch",
+    "safetensors",
+]
 
 [project.optional-dependencies]
 train = ["transformers", "peft>=0.22", "trl>=1.18", "accelerate", "bitsandbytes", "datasets", "triton"]
-test = ["pytest"]
+test = ["pytest", "pytest-timeout"]
 
 [tool.setuptools]
 packages = ["inkling_qlora"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+timeout = 300
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
-ignore = ["RUF001", "RUF002", "RUF003", "SIM108", "SIM905", "SIM103", "RUF005", "RUF007"]
+ignore = [
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    "SIM108",
+    "SIM905",
+    "SIM103",
+    "RUF005",
+    "RUF007",
+    # The modules are shared with a project linted with select = ["ALL"]; its noqa codes are kept.
+    "RUF100",
+]
 
 [tool.ruff.lint.isort]
+force-single-line = true
 known-first-party = ["inkling_qlora", "gpu_checks"]
 known-third-party = ["datasets"]
 

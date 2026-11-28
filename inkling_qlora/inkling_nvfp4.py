@@ -8,8 +8,6 @@ Layouts follow the checkpoint (see ``Quant4bitExperts`` in ``inkling.py`` and tr
 - MXFP8: float8_e4m3 values with one power-of-two scale ``2 ** (byte - 127)`` per 32 columns.
 """
 
-from __future__ import annotations
-
 import torch
 
 E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
@@ -30,7 +28,8 @@ def _scale_as_float(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype == torch.uint8:
         scale = scale.view(torch.float8_e4m3fn)
     elif scale.dtype != torch.float8_e4m3fn:
-        raise TypeError(f"scale must be uint8 (e4m3 bytes) or float8_e4m3fn, got {scale.dtype}")
+        msg = f"scale must be uint8 (e4m3 bytes) or float8_e4m3fn, got {scale.dtype}"
+        raise TypeError(msg)
     return scale.float()
 
 
@@ -74,7 +73,8 @@ def quantize_nvfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
     """
     rows, columns = w.shape
     if columns % NVFP4_BLOCK:
-        raise ValueError(f"columns ({columns}) must be divisible by {NVFP4_BLOCK}")
+        msg = f"columns ({columns}) must be divisible by {NVFP4_BLOCK}"
+        raise ValueError(msg)
     device = w.device
     w = w.float()
     amax = w.abs().max()
@@ -99,13 +99,16 @@ def quantize_nvfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
         err = ((decoded - blocks) ** 2).sum(-1)
         sign = ((blocks < 0) & (magnitude_index > 0)).to(torch.uint8) * 8  # a zero magnitude is always nibble 0
         nibbles = magnitude_index.to(torch.uint8) | sign
-        if best_err is None:
+        if best_err is None or best_scale is None or best_nibbles is None:
             best_err, best_scale, best_nibbles = err, scale_byte, nibbles
         else:
             better = err < best_err
             best_err = torch.where(better, err, best_err)
             best_scale = torch.where(better, scale_byte, best_scale)
             best_nibbles = torch.where(better[..., None], nibbles, best_nibbles)
+    if best_scale is None or best_nibbles is None:
+        msg = "no scale candidates"
+        raise RuntimeError(msg)
     nibbles = best_nibbles.reshape(rows, columns)
     codes = nibbles[:, 0::2] | (nibbles[:, 1::2] << 4)
     return codes.contiguous(), best_scale.contiguous().view(torch.float8_e4m3fn), factor

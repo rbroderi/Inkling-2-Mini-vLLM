@@ -5,17 +5,21 @@ import fcntl
 import os
 import subprocess
 import sys
-from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-LOCK_PATH = "/tmp/inkling_gpu.lock"
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+LOCK_PATH = "/tmp/inkling_gpu.lock"  # noqa: S108  # WSL lock file path
 BUSY_EXIT_CODE = 75
 
 
 def gpu_free_mib() -> int:
     """Free memory of GPU 0 in MiB (nvidia-smi, nounits)."""
     out = subprocess.run(
-        ["nvidia-smi", "--id=0", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+        ["nvidia-smi", "--id=0", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],  # noqa: S607  # fixed nvidia-smi command
         capture_output=True,
         text=True,
         check=True,
@@ -26,10 +30,10 @@ def gpu_free_mib() -> int:
 @contextmanager
 def gpu_session(min_free_mib: int = 8192) -> Iterator[None]:
     """Hold the GPU lock and require min_free_mib free; exit 75 when busy. The lock file is never deleted."""
-    fd = open(LOCK_PATH, "a+")  # noqa: SIM115 - closed in finally
+    fd = Path(LOCK_PATH).open("a+")  # noqa: SIM115  # closed in finally
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # pyrefly: ignore[missing-attribute]  # POSIX only
         except BlockingIOError:
             print(f"GPU lock {LOCK_PATH} is held by another process; exiting {BUSY_EXIT_CODE}", file=sys.stderr)
             sys.exit(BUSY_EXIT_CODE)
@@ -49,6 +53,6 @@ def gpu_session(min_free_mib: int = 8192) -> Iterator[None]:
                 sys.exit(BUSY_EXIT_CODE)
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)  # pyrefly: ignore[missing-attribute]  # POSIX only
     finally:
         fd.close()

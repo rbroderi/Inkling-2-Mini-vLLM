@@ -8,15 +8,16 @@ For layer 20, experts 0-15, both projections: relative error against the MXFP8 o
 (b) ``quantize_nvfp4``. Gate: mean (b) <= 1.15 x mean (a). Then step 1's fused/loop/golden comparison is repeated on
 layer 20 loaded with ``mxfp8_storage="nvfp4"``. The gate result is printed either way; the exit code is non-zero if
 the gate or the layer comparison fails.
-"""
-
-from __future__ import annotations
+"""  # run as scripts, not a package
 
 import torch
 
-from gpu_checks.check_real_layer import MODEL, check_layer
+from gpu_checks.check_real_layer import MODEL
+from gpu_checks.check_real_layer import check_layer
 from inkling_qlora import inkling as ik
-from inkling_qlora.inkling_nvfp4 import dequantize_mxfp8, dequantize_nvfp4, quantize_nvfp4
+from inkling_qlora.inkling_nvfp4 import dequantize_mxfp8
+from inkling_qlora.inkling_nvfp4 import dequantize_nvfp4
+from inkling_qlora.inkling_nvfp4 import quantize_nvfp4
 
 MIN_FREE_MIB = 8192
 LAYER, EXPERTS = 20, range(16)
@@ -24,11 +25,13 @@ GATE = 1.15
 
 
 def rel(x: torch.Tensor, ref: torch.Tensor) -> float:
+    """Return the relative L2 error of ``x`` against ``ref``."""
     return ((x.double() - ref.double()).norm() / ref.double().norm()).item()
 
 
 def requant_errors() -> tuple[float, float]:
-    import bitsandbytes.functional as bnbf
+    """Return the mean relative error of NF4 and of NVFP4 against the MXFP8 original."""
+    import bitsandbytes.functional as bnbf  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     snapshot = ik._snapshot(MODEL)
     files = ik.expert_tensors(snapshot)[LAYER]
@@ -58,6 +61,7 @@ def requant_errors() -> tuple[float, float]:
 
 
 def main() -> int:
+    """Evaluate the re-quantization gate, then compare the layer; return the exit code."""
     print(f"layer {LAYER}, experts {EXPERTS.start}-{EXPERTS.stop - 1}, both projections, vs the MXFP8 original")
     mean_nf4, mean_nvfp4 = requant_errors()
     ratio = mean_nvfp4 / mean_nf4

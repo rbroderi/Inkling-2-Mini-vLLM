@@ -1,17 +1,19 @@
-"""CPU checks of the banded sliding attention (ticket A1): the chunk loop against the full masked computation, in
+"""CPU checks of the banded sliding attention (ticket A1).
+
+The chunk loop is compared against the full masked computation, in
 float64, outputs and gradients. The reference below is a literal copy of the installed transformers code
 (modeling_inkling2_loop.py, transformers 5.24.0.dev0): ``repeat_kv``, ``eager_attention_forward`` and the gather
-at the end of ``Inkling2LoopRelativePositionBias.forward``. It is not imported from the code under test."""
-
-from __future__ import annotations
+at the end of ``Inkling2LoopRelativePositionBias.forward``. It is not imported from the code under test.
+"""
 
 import hashlib
 import inspect
 import types
+from typing import cast
 
 import pytest
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812  # matches the transformers reference code
 from torch import nn
 
 from inkling_qlora import inkling_banded as ib
@@ -20,6 +22,7 @@ from inkling_qlora import inkling_banded as ib
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat each key/value head ``n_rep`` times, as the model does."""
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -27,7 +30,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def eager_attention_forward(
+def eager_attention_forward(  # noqa: PLR0913, PLR0917  # literal copy of the transformers signature
     module: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -39,8 +42,10 @@ def eager_attention_forward(
     sinks: torch.Tensor | None = None,
     **kwargs,
 ):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
+    """Run the reference eager attention with a relative position bias."""
+    n_rep = cast("int", module.num_key_value_groups)
+    key_states = repeat_kv(key, n_rep)
+    value_states = repeat_kv(value, n_rep)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if position_bias is not None:
@@ -61,14 +66,15 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-def eager_attention_forward_fp64(
+def eager_attention_forward_fp64(  # noqa: PLR0913, PLR0917  # same signature as the reference
     module, query, key, value, attention_mask, scaling, dropout=0.0, position_bias=None, sinks=None, **kwargs
 ):
     """``eager_attention_forward`` with its one fp32 cast (``.float()`` before the sink softmax) made fp64.
 
     The reference softmax runs in fp32 even for fp64 inputs, so with the literal copy banded and full differ by fp32
     rounding (about 1e-7) from the different column counts alone; the 1e-12 bar is only reachable with this
-    variant. Every other line is the literal copy above."""
+    variant. Every other line is the literal copy above.
+    """
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
@@ -78,6 +84,7 @@ def eager_attention_forward_fp64(
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
 
+    assert sinks is not None
     combined_logits = torch.cat([attn_weights, sinks], dim=-1).double()  # the only change: .float() -> .double()
     attn_weights = F.softmax(combined_logits, dim=-1)[..., :-1].to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
@@ -88,6 +95,7 @@ def eager_attention_forward_fp64(
 
 
 def reference_bias(rel_logits: torch.Tensor, relative_distance: torch.Tensor, rel_extent: int) -> torch.Tensor:
+    """Gather the relative position bias for each query-key distance."""
     gather_index = relative_distance.clamp(0, rel_extent - 1).expand(*rel_logits.shape[:2], -1, -1)
     position_bias = rel_logits.gather(-1, gather_index)
     return position_bias.masked_fill((relative_distance < 0) | (relative_distance >= rel_extent), 0.0)
@@ -100,33 +108,37 @@ DTYPE = torch.float64
 
 
 class StubModule:
+    """Stand-in for the attention module with the attributes the kernels read."""
+
     num_key_value_groups = HEADS // KV_HEADS
     training = False
 
 
 def distances(t: int) -> torch.Tensor:
+    """Return the (T, T) matrix of query-minus-key distances."""
     pos = torch.arange(t)
     return pos[:, None] - pos[None, :]
 
 
 def additive_mask(t: int, padding: torch.Tensor | None = None, window: int | None = WINDOW) -> torch.Tensor:
-    """(B, 1, T, T) additive mask as transformers builds it for eager attention: a key is visible when it is causal,
-    inside the window (``kv > q - window``) and not padding."""
+    """Build the (B, 1, T, T) additive mask as transformers does for eager attention.
+
+    A key is visible when it is causal, inside the window (``kv > q - window``) and not padding.
+    """
     q = torch.arange(t)[:, None]
     kv = torch.arange(t)[None, :]
     allowed = kv <= q
     if window is not None:
         allowed = allowed & (kv > q - window)
     allowed = allowed[None, None]
-    if padding is not None:  # (B, T), 1 for real tokens
-        allowed = allowed & padding.bool()[:, None, None, :]
-    else:
-        allowed = allowed.expand(1, 1, t, t)
+    # padding is (B, T), 1 for real tokens
+    allowed = allowed & padding.bool()[:, None, None, :] if padding is not None else allowed.expand(1, 1, t, t)
     mask = torch.zeros(allowed.shape, dtype=DTYPE)
     return mask.masked_fill(~allowed, torch.finfo(DTYPE).min)
 
 
 def make_inputs(batch: int, t: int, seed: int = 0) -> dict[str, torch.Tensor]:
+    """Build random attention inputs that track gradients."""
     g = torch.Generator().manual_seed(seed)
 
     def r(*shape: int, scale: float = 1.0) -> torch.Tensor:
@@ -142,6 +154,7 @@ def make_inputs(batch: int, t: int, seed: int = 0) -> dict[str, torch.Tensor]:
 
 
 def full(inputs: dict[str, torch.Tensor], mask: torch.Tensor, attn_fn=eager_attention_forward_fp64) -> torch.Tensor:
+    """Run full attention over the whole sequence."""
     t = inputs["query"].shape[2]
     bias = reference_bias(inputs["rel_logits"], distances(t), EXTENT)
     out, _ = attn_fn(
@@ -160,6 +173,7 @@ def full(inputs: dict[str, torch.Tensor], mask: torch.Tensor, attn_fn=eager_atte
 def banded(
     inputs: dict[str, torch.Tensor], mask: torch.Tensor, chunk: int, attn_fn=eager_attention_forward_fp64
 ) -> torch.Tensor:
+    """Run banded attention in chunks."""
     t = inputs["query"].shape[2]
     return ib.banded_attention(
         attn_fn,
@@ -179,6 +193,7 @@ def banded(
 
 
 def rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Return the relative difference between two tensors."""
     return ((a - b).norm() / b.norm().clamp_min(1e-300)).item()
 
 
@@ -209,6 +224,7 @@ def compare(
 @pytest.mark.parametrize("t", [17, 31, 32, 33, 100])
 @pytest.mark.parametrize("chunk", [1, 5, 16, 64])
 def test_banded_equals_full(t: int, chunk: int) -> None:
+    """Banded equals full."""
     worst, _, _ = compare(make_inputs(1, t), additive_mask(t), chunk)
     assert max(worst.values()) <= 1e-12, worst
 
@@ -226,6 +242,7 @@ def test_banded_with_literal_reference(t: int, chunk: int) -> None:
 @pytest.mark.parametrize("t", [17, 33, 100])
 @pytest.mark.parametrize("chunk", [1, 5, 16, 64])
 def test_banded_equals_full_padded_batch(t: int, chunk: int) -> None:
+    """Banded equals full padded batch."""
     padding = torch.ones(2, t, dtype=torch.long)
     padding[0, : t // 3] = 0  # left-padded: its first rows see no key at all
     padding[1, t - t // 4 :] = 0  # right-padded
@@ -239,8 +256,11 @@ def test_banded_equals_full_padded_batch(t: int, chunk: int) -> None:
 
 @pytest.mark.parametrize("shift", [-1, 1])
 def test_off_by_one_band_is_detected(monkeypatch: pytest.MonkeyPatch, shift: int) -> None:
-    """With chunk 1 the band alone is the window, so a causal-only mask must reproduce the windowed reference. A
-    band start moved by one key either way (one real key dropped, or one key past the window kept) breaks it."""
+    """Detect a band start moved by one key.
+
+    With chunk 1 the band alone is the window, so a causal-only mask must reproduce the windowed reference. A
+    band start moved by one key either way (one real key dropped, or one key past the window kept) breaks it.
+    """
     t = 40
     inputs = make_inputs(1, t, seed=3)
     windowed, causal_only = additive_mask(t), additive_mask(t, window=None)
@@ -257,24 +277,27 @@ def test_off_by_one_band_is_detected(monkeypatch: pytest.MonkeyPatch, shift: int
 
 
 def _fallback_stub(**overrides) -> types.SimpleNamespace:
-    attrs = dict(
-        is_sliding=True,
-        sliding_window=16,
-        training=False,
-        attention_dropout=0.0,
-        config=types.SimpleNamespace(_attn_implementation="eager"),
-        relative_position_bias=nn.Module(),
-    )
+    attrs = {
+        "is_sliding": True,
+        "sliding_window": 16,
+        "training": False,
+        "attention_dropout": 0.0,
+        "config": types.SimpleNamespace(_attn_implementation="eager"),
+        "relative_position_bias": nn.Module(),
+    }
     attrs.update(overrides)
     return types.SimpleNamespace(**attrs)
 
 
 def test_fallback_conditions() -> None:
+    """Fallback conditions."""
     t = 40
     hidden = torch.zeros(1, t, 4)
     mask, dist = torch.zeros(1, 1, t, t), distances(t)
 
-    def uses_original(stub=None, hidden=hidden, mask=mask, dist=dist, cache=None, **kwargs) -> bool:
+    def uses_original(
+        stub=None, hidden=hidden, mask: torch.Tensor | None = mask, dist=dist, cache=None, **kwargs
+    ) -> bool:
         return ib._use_original(stub or _fallback_stub(), hidden, mask, dist, cache, kwargs)
 
     assert not uses_original()
@@ -306,6 +329,7 @@ def test_fallback_conditions() -> None:
 
 
 def test_band_start() -> None:
+    """Band start."""
     assert [ib.band_start(qs, 1024) for qs in (0, 256, 1023, 1024, 1280)] == [0, 0, 0, 1, 257]
 
 
@@ -313,13 +337,14 @@ def test_changed_source_hash_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each pinned function is checked: a changed source for any one of them raises, naming it."""
     names = list(ib.PINNED_SOURCE_SHA256)
     assert {"get_relative_distance", "masking_utils.sliding_window_overlay"} <= set(names)
-    fake = {name: repeat_kv for name in names}
+    fake = dict.fromkeys(names, repeat_kv)
     monkeypatch.setattr(ib, "_reference_functions", lambda modeling: fake)
     digest = hashlib.sha256(inspect.getsource(repeat_kv).encode()).hexdigest()
     monkeypatch.setattr(ib, "PINNED_SOURCE_SHA256", dict.fromkeys(names, digest))
-    ib.check_reference_sources(None)
+    no_modeling = types.ModuleType("unused")  # the patched _reference_functions ignores the module
+    ib.check_reference_sources(no_modeling)
     for name in names:
         monkeypatch.setitem(ib.PINNED_SOURCE_SHA256, name, "0" * 64)
         with pytest.raises(RuntimeError, match=f"source of {name} changed"):
-            ib.check_reference_sources(None)
+            ib.check_reference_sources(no_modeling)
         monkeypatch.setitem(ib.PINNED_SOURCE_SHA256, name, digest)

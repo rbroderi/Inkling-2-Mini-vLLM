@@ -1,4 +1,6 @@
-"""Block-size sweep for the NVFP4 grouped GEMM on a real layer (ticket T5, step 3, of
+"""Sweep block sizes for the NVFP4 grouped GEMM on a real layer.
+
+Block-size sweep for the NVFP4 grouped GEMM on a real layer (ticket T5, step 3, of
 docs/inkling_fused_experts_plan.md).
 
 Run in WSL (takes the GPU lock, needs 8 GiB free, exits 75 if the GPU is busy):
@@ -15,17 +17,17 @@ must be >= it (a larger BLOCK_M only wastes tile rows), so BLOCK_M = block_m is 
 minimises the per-example cost 2 x (forward gate_up + forward down) + transposed gate_up + transposed down (gradient
 checkpointing runs the forward twice), and the other sizes are the fastest per (projection, transpose) at that block_m.
 Prints the table to paste into ``inkling_triton.TUNED_BLOCK_SIZES``.
-"""
-
-from __future__ import annotations
+"""  # run as scripts, not a package
 
 import itertools
 import statistics
 import time
+from typing import Any
 
 import torch
 
-from gpu_checks.check_real_layer import load_layer, make_inputs
+from gpu_checks.check_real_layer import load_layer
+from gpu_checks.check_real_layer import make_inputs
 from inkling_qlora.inkling_kernels import build_route_plan
 from inkling_qlora.inkling_triton import nvfp4_grouped_gemm
 
@@ -35,6 +37,7 @@ CALLS_PER_EXAMPLE = {("gate_up", False): 2, ("down", False): 2, ("gate_up", True
 
 
 def time_call(fn) -> float:
+    """Return the median time of ``fn`` in milliseconds after warm-up calls."""
     for _ in range(5):
         fn()
     times = []
@@ -47,8 +50,9 @@ def time_call(fn) -> float:
     return statistics.median(times) * 1e3
 
 
-def main() -> None:
-    mod = load_layer(0)
+def main() -> None:  # noqa: C901  # check script, one long flow
+    """Sweep the block sizes for each projection and print the timings."""
+    mod: Any = load_layer(0)
     hidden, top_k_index, _, _ = make_inputs(mod)
     lut = mod._backend(hidden.device).e4m3_lut
     weights = {
@@ -67,23 +71,29 @@ def main() -> None:
     print(f"{num_rows} rows over {mod.num_experts} experts, bf16", flush=True)
     for block_m in BLOCK_MS:
         plan = build_route_plan(top_k_index, mod.num_experts, block_m)
-        table = (plan.expert_of_block, plan.block_row0, plan.block_rows)
+        table: tuple[Any, Any, Any] = (plan.expert_of_block, plan.block_row0, plan.block_rows)
         for (proj, transpose), bn, bk, warps in itertools.product(CALLS_PER_EXAMPLE, BLOCK_NS, BLOCK_KS, WARPS):
             codes, scale, factor = weights[proj]
             inp = inputs[(proj, transpose)]
             ms = None
             for stages in (3, 2):
-                sizes = dict(block_m=block_m, block_n=bn, block_k=bk, num_warps=warps, num_stages=stages)
+                sizes: dict[str, Any] = {
+                    "block_m": block_m,
+                    "block_n": bn,
+                    "block_k": bk,
+                    "num_warps": warps,
+                    "num_stages": stages,
+                }
 
-                def call(
+                def call(  # noqa: PLR0913, PLR0917  # check helper, many inputs
                     sizes=sizes, codes=codes, scale=scale, factor=factor, inp=inp, transpose=transpose, table=table
                 ):
-                    nvfp4_grouped_gemm(inp, codes, scale, factor, lut, *table, transpose, **sizes)
+                    nvfp4_grouped_gemm(inp, codes, scale, factor, lut, table[0], table[1], table[2], transpose, **sizes)
 
                 try:
                     ms = time_call(call)
                     break
-                except Exception as exc:  # triton OutOfResources (shared memory) and the like
+                except Exception as exc:  # triton OutOfResources (shared memory) and the like  # noqa: BLE001  # sweep records any failure
                     print(f"  skip {proj} T={int(transpose)} {sizes}: {type(exc).__name__}", flush=True)
             if ms is None:
                 continue

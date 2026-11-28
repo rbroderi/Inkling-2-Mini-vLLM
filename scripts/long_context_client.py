@@ -1,5 +1,6 @@
 """Client of long_context_probe.sh: one synthetic ~90% prompt against a running server. Prints one tab-separated line:
 prefill_s, prompt_tokens, decode_tok_s, needle (pass|fail). Needs only the standard library."""
+
 import argparse
 import json
 import time
@@ -51,8 +52,14 @@ r = json.load(post("/v1/chat/completions", {**chat, "messages": msg(question), "
 needle = "pass" if CODE in r["choices"][0]["message"]["content"] else "fail"
 
 # Decode speed at this context (the shared prefix is cached, so this is almost pure decode).
-body = {**chat, "messages": msg("\n\nWrite a long story about the archive."), "max_tokens": a.decode_tokens,
-        "min_tokens": a.decode_tokens, "stream": True, "stream_options": {"include_usage": True}}
+body = {
+    **chat,
+    "messages": msg("\n\nWrite a long story about the archive."),
+    "max_tokens": a.decode_tokens,
+    "min_tokens": a.decode_tokens,
+    "stream": True,
+    "stream_options": {"include_usage": True},
+}
 first = last = None
 count = 0
 for raw in post("/v1/chat/completions", body):

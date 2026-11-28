@@ -1,43 +1,59 @@
+"""Tests for inkling."""
+
+import sys
+import types
+from typing import Any
+from typing import cast
+
 import pytest
 
-torch = pytest.importorskip("torch")
+pytest.importorskip("torch")
 
-from inkling_qlora.inkling import _embeddings_to_cpu  # noqa: E402
+import torch
+
+from inkling_qlora.inkling import _embeddings_to_cpu
 
 
 class NormedEmbedding(torch.nn.Embedding):
     """Shaped like Inkling2LoopNormedEmbedding: a lookup, then a norm with its own weight."""
 
     def __init__(self) -> None:
+        """Build a 50 x 8 embedding with an RMS norm."""
         super().__init__(50, 8, padding_idx=0)
         self.embed_norm = torch.nn.RMSNorm(8)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride]  # pyrefly: ignore[bad-override-param-name]
+        """Look up ``input_ids``, then norm the result."""
         return self.embed_norm(super().forward(input_ids))
 
 
 def test_cpu_embeddings_match_and_leave_the_parameters() -> None:
+    """Check cpu embeddings match and leave the parameters."""
     torch.manual_seed(0)
     model = torch.nn.Sequential(NormedEmbedding(), torch.nn.Linear(8, 3))
     ids = torch.tensor([[0, 5, 49, 7]])
     expected = model(ids)
 
-    _embeddings_to_cpu(model[0])
+    emb = cast("Any", model[0])
+    _embeddings_to_cpu(emb)
 
     names = [n for n, _ in model.named_parameters()]
-    assert "0.weight" not in names and "0.embed_norm.weight" in names
-    assert next(model.parameters()).device == model[0].embed_norm.weight.device
-    assert model[0].cpu_table.device.type == "cpu"
-    emb = model[0]
-    assert emb.weight is emb.cpu_table and not emb.weight.requires_grad
+    assert "0.weight" not in names
+    assert "0.embed_norm.weight" in names
+    assert next(model.parameters()).device == emb.embed_norm.weight.device
+    assert emb.cpu_table.device.type == "cpu"
+    assert emb.weight is emb.cpu_table
+    assert not emb.weight.requires_grad
     assert not isinstance(emb.weight, torch.nn.Parameter)
     assert all(p is not emb.weight for p in model.parameters())
     assert all(b is not emb.weight for b in model.buffers())
-    assert not any(k.startswith("0.weight") for k in model.state_dict()) and "0.cpu_table" not in model.state_dict()
+    assert not any(k.startswith("0.weight") for k in model.state_dict())
+    assert "0.cpu_table" not in model.state_dict()
     torch.testing.assert_close(model(ids), expected)
 
 
 def test_cpu_embedding_weight_survives_the_bnb_override_lookup() -> None:
+    """Check cpu embedding weight survives the bnb override lookup."""
     bnb = pytest.importorskip("bitsandbytes")
     emb = NormedEmbedding()
     _embeddings_to_cpu(emb)
@@ -57,14 +73,16 @@ def test_cpu_embedding_weight_survives_the_bnb_override_lookup() -> None:
 def test_cpu_embeddings_work_with_input_require_grads() -> None:
     # what enable_input_require_grads does for LoRA with gradient checkpointing: mark the embedding output as needing
     # gradients so they reach the adapters
+    """Check cpu embeddings work with input require grads."""
     model = torch.nn.Sequential(NormedEmbedding(), torch.nn.Linear(8, 3))
-    _embeddings_to_cpu(model[0])
-    model[0].register_forward_hook(lambda _m, _i, out: out.requires_grad_(True))
+    emb = cast("Any", model[0])
+    _embeddings_to_cpu(emb)
+    emb.register_forward_hook(lambda _m, _i, out: out.requires_grad_())
     for p in model[1].parameters():
-        p.requires_grad_(False)
+        p.requires_grad = False
     out = model(torch.tensor([[1, 2, 3]]))
     out.sum().backward()
-    assert model[0].embed_norm.weight.grad is not None
+    assert emb.embed_norm.weight.grad is not None
 
 
 # ---- fused experts integration (T4) ----
@@ -72,8 +90,10 @@ def test_cpu_embeddings_work_with_input_require_grads() -> None:
 from types import SimpleNamespace  # noqa: E402
 
 from inkling_qlora import inkling  # noqa: E402
-from inkling_qlora.inkling import Quant4bitExperts, requantize_mxfp8_to_nvfp4  # noqa: E402
-from inkling_qlora.inkling_nvfp4 import dequantize_mxfp8, dequantize_nvfp4  # noqa: E402
+from inkling_qlora.inkling import Quant4bitExperts  # noqa: E402
+from inkling_qlora.inkling import requantize_mxfp8_to_nvfp4  # noqa: E402
+from inkling_qlora.inkling_nvfp4 import dequantize_mxfp8  # noqa: E402
+from inkling_qlora.inkling_nvfp4 import dequantize_nvfp4  # noqa: E402
 
 E, H, I = 4, 32, 16  # noqa: E741
 
@@ -109,10 +129,12 @@ def _route(tokens: int = 24, k: int = 3, seed: int = 1) -> tuple[torch.Tensor, t
 
 
 def _run(module: Quant4bitExperts, x: torch.Tensor, index: torch.Tensor, w: torch.Tensor):
-    x = x.clone().requires_grad_(True)
-    w = w.clone().requires_grad_(True)
+    x = x.clone().requires_grad_()
+    w = w.clone().requires_grad_()
     out = module(x, index, w)
     out.pow(2).sum().backward()
+    assert x.grad is not None
+    assert w.grad is not None
     return out.detach(), x.grad, w.grad
 
 
@@ -121,6 +143,7 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def test_fused_matches_loop_forward_and_backward() -> None:
+    """Check fused matches loop forward and backward."""
     packed = _random_packed()
     x = torch.randn(24, H, generator=torch.Generator().manual_seed(2))
     index, weights = _route()
@@ -132,6 +155,7 @@ def test_fused_matches_loop_forward_and_backward() -> None:
 
 
 def test_set_nvfp4_keeps_buffers() -> None:
+    """Check set nvfp4 keeps buffers."""
     g = torch.Generator().manual_seed(3)
     parts = {}
     for proj, rows, cols in (("w13", 2 * I, H), ("w2", H, I)):
@@ -141,7 +165,8 @@ def test_set_nvfp4_keeps_buffers() -> None:
         parts[f"{proj}_weight_outer_scale_denominator"] = torch.full((E,), 2688.0)
     module = Quant4bitExperts(_config())
     module.set_nvfp4(parts, "cpu")
-    assert module.storage == "nvfp4" and module.loaded
+    assert module.storage == "nvfp4"
+    assert module.loaded
     for proj, name in (("w13", "gate_up"), ("w2", "down")):
         assert torch.equal(getattr(module, f"{name}_codes"), parts[f"{proj}_weight"])
         assert torch.equal(
@@ -153,24 +178,29 @@ def test_set_nvfp4_keeps_buffers() -> None:
 
 
 def test_nf4_storage_falls_back_to_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check nf4 storage falls back to loop."""
     module = Quant4bitExperts(_config())
     module.storage, module.impl = "nf4", "fused"
     called = []
-    monkeypatch.setattr(module, "_forward_loop", lambda *a: called.append(a) or "loop")
-    assert module(torch.zeros(2, H), torch.zeros(2, 1, dtype=torch.long), torch.ones(2, 1)) == "loop"
+    loop_out = torch.zeros(2, H)
+    monkeypatch.setattr(module, "_forward_loop", lambda *a: called.append(a) or loop_out)
+    assert module(torch.zeros(2, H), torch.zeros(2, 1, dtype=torch.long), torch.ones(2, 1)) is loop_out
     assert len(called) == 1
 
 
 def test_backend_is_cached_and_follows_buffer_replacement() -> None:
+    """Check backend is cached and follows buffer replacement."""
     module = _experts("fused", _random_packed())
     first = module._backend(torch.device("cpu"))
     assert module._backend(torch.device("cpu")) is first
     assert not any(n.startswith("_backend") for n, _ in module.named_buffers())
-    module.gate_up_codes = module.gate_up_codes.clone()  # what .to() does: a new tensor replaces the buffer
+    # what .to() does: a new tensor replaces the buffer
+    module.gate_up_codes = cast("torch.Tensor", module.gate_up_codes).clone()
     assert module._backend(torch.device("cpu")) is not first
 
 
 def test_experts_impl_environment_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check experts impl environment switch."""
     monkeypatch.delenv("INKLING_EXPERTS_IMPL", raising=False)
     assert inkling.resolve_experts_impl(None) == "fused"  # the default since T7
     assert inkling.resolve_experts_impl("loop") == "loop"
@@ -178,11 +208,11 @@ def test_experts_impl_environment_switch(monkeypatch: pytest.MonkeyPatch) -> Non
     assert inkling.resolve_experts_impl(None) == "loop"
     assert inkling.resolve_experts_impl("fused") == "fused"  # an explicit argument wins in the loader itself
     monkeypatch.setattr(inkling.os, "environ", {"INKLING_EXPERTS_IMPL": "bogus"})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="experts_impl must be one of"):
         inkling.load_inkling_4bit()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="experts_impl must be one of"):
         inkling.load_inkling_4bit(experts_impl="fast")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="mxfp8_storage must be"):
         inkling.load_inkling_4bit(experts_impl="loop", mxfp8_storage="int4")
     # a valid value passes the validation (then needs the Inkling transformers build, which is absent or slow here)
     monkeypatch.setattr(inkling.os, "environ", {"INKLING_EXPERTS_IMPL": "fused"})
@@ -192,6 +222,7 @@ def test_experts_impl_environment_switch(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_banded_attention_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check banded attention switch."""
     monkeypatch.delenv("INKLING_BANDED_ATTENTION", raising=False)
     assert inkling.BANDED_ATTENTION_DEFAULT is True  # A1's gate passed (section 10.4)
     assert inkling.resolve_banded_attention(None) is True  # unset -> the default
@@ -199,23 +230,28 @@ def test_banded_attention_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert inkling.resolve_banded_attention(None) is False
     monkeypatch.setenv("INKLING_BANDED_ATTENTION", "1")
     assert inkling.resolve_banded_attention(None) is True
-    assert inkling.resolve_banded_attention(False) is False  # an explicit argument wins over the variable
+    assert (
+        inkling.resolve_banded_attention(banded_attention=False) is False
+    )  # an explicit argument wins over the variable
     monkeypatch.delenv("INKLING_BANDED_ATTENTION")
-    assert inkling.resolve_banded_attention(False) is False
-    assert inkling.resolve_banded_attention(True) is True
+    assert inkling.resolve_banded_attention(banded_attention=False) is False
+    assert inkling.resolve_banded_attention(banded_attention=True) is True
     monkeypatch.setattr(inkling, "BANDED_ATTENTION_DEFAULT", False)  # the default is read at call time
     assert inkling.resolve_banded_attention(None) is False
     monkeypatch.setenv("INKLING_BANDED_ATTENTION", "1")
     assert inkling.resolve_banded_attention(None) is True
     for bad in ("", "true", "on", "2"):
         monkeypatch.setenv("INKLING_BANDED_ATTENTION", bad)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="INKLING_BANDED_ATTENTION must be"):
             inkling.resolve_banded_attention(None)
-        with pytest.raises(ValueError):  # the loader rejects it before it touches the model
+        with pytest.raises(
+            ValueError, match="INKLING_BANDED_ATTENTION must be"
+        ):  # the loader rejects it before it touches the model
             inkling.load_inkling_4bit(device="cpu")
 
 
 def test_mxfp8_layer_requantized_to_nvfp4_keeps_checkpoint_row_order() -> None:
+    """Check mxfp8 layer requantized to nvfp4 keeps checkpoint row order."""
     g = torch.Generator().manual_seed(4)
     raw = {}
     for proj, rows, cols in (("w13", 2 * I, 64), ("w2", 64, I * 2)):
@@ -238,12 +274,12 @@ def test_mxfp8_layer_requantized_to_nvfp4_keeps_checkpoint_row_order() -> None:
     module.set_nvfp4_packed(packed, "cpu")
     w = module.weight("gate_up", 1).float()
     original = dequantize_mxfp8(raw["w13_weight"], raw["w13_weight_scale"])[1]
-    assert _rel(w[:I], original[0::2]) < 0.12 and _rel(w[I:], original[1::2]) < 0.12
-
-
+    assert _rel(w[:I], original[0::2]) < 0.12
+    assert _rel(w[I:], original[1::2]) < 0.12
 
 
 def test_to_drops_backend_cache_and_keeps_packed_dtypes() -> None:
+    """Check to drops backend cache and keeps packed dtypes."""
     module = _experts("fused", _random_packed())
     old = module._backend(torch.device("cpu"))
     assert module._backend_cache is not None
@@ -251,7 +287,7 @@ def test_to_drops_backend_cache_and_keeps_packed_dtypes() -> None:
     assert module._backend_cache is None
     assert module._backend(torch.device("cpu")) is not old
 
-    factor = module.gate_up_factor.clone()
+    factor = cast("torch.Tensor", module.gate_up_factor).clone()
     module.to(torch.bfloat16)  # a dtype cast must not touch the packed buffers
     module.float()
     assert module._backend_cache is None
@@ -259,7 +295,7 @@ def test_to_drops_backend_cache_and_keeps_packed_dtypes() -> None:
         assert getattr(module, f"{name}_codes").dtype == torch.uint8
         assert getattr(module, f"{name}_scale").dtype == torch.float8_e4m3fn
         assert getattr(module, f"{name}_factor").dtype == torch.float32
-    assert torch.equal(module.gate_up_factor, factor)
+    assert torch.equal(cast("torch.Tensor", module.gate_up_factor), factor)
     assert module.byte_to_values.dtype == torch.float32  # the loop's lookup table follows .float()/.to(dtype)
     x = torch.randn(8, H)
     index, weights = _route(8)
@@ -267,7 +303,8 @@ def test_to_drops_backend_cache_and_keeps_packed_dtypes() -> None:
 
 
 def test_qlora_env_overrides_config_impl(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    from inkling_qlora.train import inkling_experts_impl
+    """The INKLING_EXPERTS_IMPL environment variable overrides the configured experts impl."""
+    from inkling_qlora.train import inkling_experts_impl  # noqa: PLC0415  # the trainer imports the training stack
 
     cfg = "fused"
     monkeypatch.delenv("INKLING_EXPERTS_IMPL", raising=False)
@@ -278,16 +315,10 @@ def test_qlora_env_overrides_config_impl(monkeypatch: pytest.MonkeyPatch, caplog
     assert "INKLING_EXPERTS_IMPL=loop overrides" in caplog.text
 
 
-
-
-
-
 def test_loader_pins_the_inkling_revision(monkeypatch: pytest.MonkeyPatch) -> None:
-    import sys
-    import types
-
-    import huggingface_hub
-    import transformers
+    """Check loader pins the inkling revision."""
+    import huggingface_hub  # noqa: PLC0415  # optional heavy dependency
+    import transformers  # noqa: PLC0415  # optional heavy dependency
 
     calls: dict[str, list] = {"snapshot": [], "from_pretrained": []}
     monkeypatch.setattr(
@@ -303,30 +334,31 @@ def test_loader_pins_the_inkling_revision(monkeypatch: pytest.MonkeyPatch) -> No
     inkling._snapshot(model_id)
     assert calls["snapshot"] == [(model_id, inkling.INKLING_REVISION), ("someone/else", None), (model_id, "abc123")]
 
-    class Stop(Exception):
+    class StopError(Exception):
         pass
 
     class FakeAuto:
         @staticmethod
         def from_pretrained(mid, **kwargs):
             calls["from_pretrained"].append((mid, kwargs.get("revision")))
-            raise Stop
+            raise StopError
 
-    fake = types.ModuleType("modeling_inkling2_loop")
+    fake: Any = types.ModuleType("modeling_inkling2_loop")
     fake.Inkling2LoopExperts = object
     fake.AutoModel = object
     fake.Inkling2LoopPreTrainedModel = type("Base", (), {"_init_weights": lambda self, module: None})
-    package = types.ModuleType("inkling2_loop")
+    package: Any = types.ModuleType("inkling2_loop")
     package.modeling_inkling2_loop = fake
     monkeypatch.setitem(sys.modules, "transformers.models.inkling2_loop", package)
     monkeypatch.setitem(sys.modules, "transformers.models.inkling2_loop.modeling_inkling2_loop", fake)
     monkeypatch.setattr(transformers, "AutoModelForImageTextToText", FakeAuto)
-    for kwargs, expected in (({}, "abc123"), ({"revision": "explicit"}, "explicit")):
-        with pytest.raises(Stop):
+    revision_cases: list[tuple[dict[str, Any], str]] = [({}, "abc123"), ({"revision": "explicit"}, "explicit")]
+    for kwargs, expected in revision_cases:
+        with pytest.raises(StopError):
             inkling.load_inkling_4bit(model_id, device="cpu", experts_impl="loop", **kwargs)
         assert calls["from_pretrained"][-1] == (model_id, expected)
     monkeypatch.delenv("INKLING_REVISION")
-    with pytest.raises(Stop):
+    with pytest.raises(StopError):
         inkling.load_inkling_4bit(model_id, device="cpu", experts_impl="loop")
     assert calls["from_pretrained"][-1] == (model_id, inkling.INKLING_REVISION)
     assert fake.Inkling2LoopExperts is object  # the loader restored the patched names

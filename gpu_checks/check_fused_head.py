@@ -14,17 +14,21 @@ at the example nearest 1002 tokens and the one nearest 495 tokens (experiment E2
 
 Run: cd /path/to/Inkling-2-Mini-vLLM && HF_HUB_OFFLINE=1 PYTHONPATH=. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
      ~/inkling-venv/bin/python gpu_checks/check_fused_head.py
-"""
+"""  # run as scripts, not a package
 
 import os
 import random
+from pathlib import Path
+from typing import Any
 
 import torch
-import torch.nn.functional as F
-from peft import LoraConfig, get_peft_model
+import torch.nn.functional as F  # noqa: N812  # torch convention
+from peft import LoraConfig
+from peft import get_peft_model
 from transformers import AutoTokenizer
 from trl.kernels.chunked_logprob import ChunkedLogProbFunction
-from trl.trainer.utils import _CHUNKED_LOGPROB_CHUNK_SIZE, add_fused_lm_head
+from trl.trainer.utils import _CHUNKED_LOGPROB_CHUNK_SIZE
+from trl.trainer.utils import add_fused_lm_head
 
 from gpu_checks.gpu_guard import gpu_session
 from inkling_qlora import inkling as ik
@@ -36,16 +40,17 @@ GiB = 2**30
 
 with gpu_session(min_free_mib=21000):
     MODEL = "thinkingmachines/Inkling-2-Mini"
-    model = ik.load_inkling_4bit(MODEL, device="cuda", experts_impl="fused", mxfp8_storage="nvfp4")
+    model: Any = ik.load_inkling_4bit(MODEL, device="cuda", experts_impl="fused", mxfp8_storage="nvfp4")
     add_fused_lm_head(
         model, outputs=("log_probs", "entropy", "is_top1")
     )  # SFTTrainer's outputs  # before get_peft_model, as SFTTrainer does
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    examples = read_records(os.environ.get("INKLING_CHECK_DATA", "data/train.jsonl"))
-    random.Random(0).shuffle(examples)
-    records = examples[:40]
+    tok: Any = AutoTokenizer.from_pretrained(MODEL)
+    examples = read_records(Path(os.environ.get("INKLING_CHECK_DATA", "data/train.jsonl")))
+    random.Random(0).shuffle(examples)  # noqa: S311  # seeded sampling, not security
+    records = [ex for ex in examples[:40]]
 
     def encode(rec):
+        """Render one chat record into token ids and labels with the prompt masked."""
         prompt = tok.apply_chat_template(
             rec["prompt"], add_generation_prompt=True, tokenize=False, **ik.INKLING_CHAT_TEMPLATE_KWARGS
         )
@@ -110,9 +115,11 @@ with gpu_session(min_free_mib=21000):
     model.train()
 
     def pick(target):
+        """Return the encoded example whose length is closest to ``target``."""
         return min(encoded, key=lambda e: abs(e[0].shape[1] - target))
 
     def step(ids, labels, fused):
+        """Run one forward and backward pass, with the fused head if ``fused``, and return the loss."""
         kw = {"fused_lm_head": True} if fused else {}
         loss = model(input_ids=ids, labels=labels, **kw).loss
         loss.backward()

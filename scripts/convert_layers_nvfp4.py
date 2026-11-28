@@ -90,16 +90,25 @@ def dry_run(codec, snapshot: Path, layer: int, max_experts: int | None) -> None:
 
     prefix = "model.llm.layers.{}.mlp.experts."
     with safe_open(snapshot / SHARD, "pt") as fh:
-        ref = {k.removeprefix(prefix.format(0)): (tuple(fh.get_slice(k).get_shape()), fh.get_slice(k).get_dtype())
-               for k in fh.keys() if k.startswith(prefix.format(0))}
-        raw = {k.removeprefix(prefix.format(layer)): fh.get_tensor(k) for k in fh.keys() if k.startswith(prefix.format(layer))}
+        ref = {
+            k.removeprefix(prefix.format(0)): (tuple(fh.get_slice(k).get_shape()), fh.get_slice(k).get_dtype())
+            for k in fh.keys()
+            if k.startswith(prefix.format(0))
+        }
+        raw = {
+            k.removeprefix(prefix.format(layer)): fh.get_tensor(k)
+            for k in fh.keys()
+            if k.startswith(prefix.format(layer))
+        }
     assert not any("amax" in k for k in raw), f"layer {layer} is already NVFP4"
     print(f"layer {layer}: source tensors")
     for k, v in sorted(raw.items()):
         print(f"  {k:36s} {v.dtype!s:22s} {tuple(v.shape)}")
     t0 = time.time()
     new = convert_layer(codec, raw, max_experts)
-    print(f"converted {max_experts or 128} experts per projection on the CPU in {time.time() - t0:.0f} s; compare with layer 0:")
+    print(
+        f"converted {max_experts or 128} experts per projection on the CPU in {time.time() - t0:.0f} s; compare with layer 0:"
+    )
     bad = 0
     for k, v in sorted(new.items()):
         shape, dtype = ref[k]
@@ -108,7 +117,9 @@ def dry_run(codec, snapshot: Path, layer: int, max_experts: int | None) -> None:
             want[0] = max_experts
         ok = list(v.shape) == want and DT_NAME[v.dtype] == dtype
         bad += not ok
-        print(f"  {k:36s} {DT_NAME[v.dtype]:8s} {tuple(v.shape)!s:20s} layer 0: {dtype} {shape}  {'OK' if ok else 'MISMATCH'}")
+        print(
+            f"  {k:36s} {DT_NAME[v.dtype]:8s} {tuple(v.shape)!s:20s} layer 0: {dtype} {shape}  {'OK' if ok else 'MISMATCH'}"
+        )
     print("round trip (relative L2 error of NVFP4 vs the MXFP8 source), first 3 experts:")
     for proj in ("w13", "w2"):
         errs = []
@@ -133,7 +144,9 @@ def convert(codec, snapshot: Path, out: Path, layers: list[int]) -> None:
     header, base = read_header(src_path)
     meta = header.pop("__metadata__", {"format": "pt"})
     prefix = "model.llm.layers.{}.mlp.experts."
-    drop = {prefix.format(l) + s for l in layers for s in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")}
+    drop = {
+        prefix.format(l) + s for l in layers for s in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+    }
     missing = drop - header.keys()
     assert not missing, missing
     # new tensors' shapes are known from the source shapes without converting
@@ -147,7 +160,10 @@ def convert(codec, snapshot: Path, out: Path, layers: list[int]) -> None:
             new_meta[prefix.format(l) + f"{proj}_weight_outer_scale_denominator"] = ("F32", [1])
     sizes = {n: (d, s) for n, (d, s) in new_meta.items()}
     unit = {"U8": 1, "F8_E4M3": 1, "F32": 4}
-    order = [n for n, _ in sorted(((n, v["data_offsets"][0]) for n, v in header.items() if n not in drop), key=lambda t: t[1])]
+    order = [
+        n
+        for n, _ in sorted(((n, v["data_offsets"][0]) for n, v in header.items() if n not in drop), key=lambda t: t[1])
+    ]
     order += sorted(new_meta)
     new_header, offset = {"__metadata__": meta}, 0
     for n in order:
@@ -175,8 +191,10 @@ def convert(codec, snapshot: Path, out: Path, layers: list[int]) -> None:
             if n in new_meta:
                 l = int(n.split(".layers.")[1].split(".")[0])
                 if l not in pending:
-                    raw = {k: fh.get_tensor(prefix.format(l) + k) for k in
-                           ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")}
+                    raw = {
+                        k: fh.get_tensor(prefix.format(l) + k)
+                        for k in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+                    }
                     pending = {l: convert_layer(codec, raw)}
                     print(f"layer {l} converted ({time.time() - t0:.0f} s)", flush=True)
                 t = pending[l][n.rsplit(".", 1)[1]].contiguous()
@@ -213,7 +231,10 @@ def convert(codec, snapshot: Path, out: Path, layers: list[int]) -> None:
     idx["metadata"]["total_size"] = offset
     (out / "model.safetensors.index.json").write_text(json.dumps(idx, indent=2))
     for p in snapshot.iterdir():  # everything else is shared with the original through symlinks
-        if p.name not in (SHARD, "hf_quant_config.json", "model.safetensors.index.json") and not (out / p.name).exists():
+        if (
+            p.name not in (SHARD, "hf_quant_config.json", "model.safetensors.index.json")
+            and not (out / p.name).exists()
+        ):
             (out / p.name).symlink_to(p.resolve())
     print(f"done: {out} ({(8 + len(hb) + offset) / 2**30:.2f} GiB shard, {time.time() - t0:.0f} s)")
 
@@ -223,7 +244,9 @@ def main() -> None:
     ap.add_argument("--snapshot", help="original snapshot dir (default: newest with the weights in the HF cache)")
     ap.add_argument("--out", default=str(Path.home() / "inkling_nvfp4_all"))
     ap.add_argument("--layers", type=int, nargs="+", default=[20, 21, 22, 23])
-    ap.add_argument("--dry-run-layer", type=int, help="convert this one layer in memory, check names/shapes, write nothing")
+    ap.add_argument(
+        "--dry-run-layer", type=int, help="convert this one layer in memory, check names/shapes, write nothing"
+    )
     ap.add_argument("--max-experts", type=int, help="dry run only: convert just the first N experts")
     a = ap.parse_args()
     codec = load_codec()

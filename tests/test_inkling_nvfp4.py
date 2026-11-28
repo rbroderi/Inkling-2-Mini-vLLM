@@ -1,21 +1,17 @@
 """CPU tests for the pure-torch NVFP4/MXFP8 codec."""
 
-from __future__ import annotations
-
 import os
 from pathlib import Path
 
 import pytest
 import torch
 
-from inkling_qlora.inkling_nvfp4 import (
-    E2M1_VALUES,
-    _round_to_e4m3,
-    dequantize_mxfp8,
-    dequantize_nvfp4,
-    e4m3_table,
-    quantize_nvfp4,
-)
+from inkling_qlora.inkling_nvfp4 import E2M1_VALUES
+from inkling_qlora.inkling_nvfp4 import _round_to_e4m3
+from inkling_qlora.inkling_nvfp4 import dequantize_mxfp8
+from inkling_qlora.inkling_nvfp4 import dequantize_nvfp4
+from inkling_qlora.inkling_nvfp4 import e4m3_table
+from inkling_qlora.inkling_nvfp4 import quantize_nvfp4
 
 # Literal copy of the NVFP4 branch of Quant4bitExperts.weight (inkling.py), without the de-interleave and bf16 cast.
 _REF_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
@@ -44,13 +40,19 @@ def _random_nvfp4(experts=3, rows=8, columns=64, seed=0):
 
 
 def test_e4m3_table_finite():
+    """Check e4m3 table finite."""
     t = e4m3_table()
-    assert t.shape == (256,) and t.dtype == torch.float32
+    assert t.shape == (256,)
+    assert t.dtype == torch.float32
     assert torch.isfinite(t).all()
-    assert t[0x7E] == 448.0 and t[0x7F] == 0.0 and t[0xFF] == 0.0 and t[0x01] == 2.0**-9
+    assert t[0x7E] == 448.0
+    assert t[0x7F] == 0.0
+    assert t[0xFF] == 0.0
+    assert t[0x01] == 2.0**-9
 
 
 def test_dequantize_matches_reference_exactly():
+    """Check dequantize matches reference exactly."""
     codes, scale, factor = _random_nvfp4()
     ref = _reference_nvfp4(codes, scale.view(torch.float8_e4m3fn), factor)
     assert torch.equal(dequantize_nvfp4(codes, scale, factor), ref)
@@ -59,6 +61,7 @@ def test_dequantize_matches_reference_exactly():
 
 
 def test_float64_and_scalar_factor():
+    """Check float64 and scalar factor."""
     codes, scale, factor = _random_nvfp4()
     d64 = dequantize_nvfp4(codes, scale, factor, dtype=torch.float64)
     assert d64.dtype == torch.float64
@@ -68,6 +71,7 @@ def test_float64_and_scalar_factor():
 
 
 def test_nibble_order_and_values():
+    """Check nibble order and values."""
     for nibble in range(16):
         # low nibble = even column, high nibble = odd column
         byte = torch.tensor([[nibble | (((nibble + 3) % 16) << 4)] * 8], dtype=torch.uint8)  # (1, 8): 16 columns
@@ -100,6 +104,7 @@ def _own_rule_matrix(seed=1):
 
 
 def test_round_trip_exact_with_own_factor_rule():
+    """Check round trip exact with own factor rule."""
     codes, scale, factor = _own_rule_matrix()
     w = dequantize_nvfp4(codes, scale, factor)
     assert w.abs().max() == 6 * 448 * factor  # so quantize_nvfp4 re-derives the same factor
@@ -109,11 +114,15 @@ def test_round_trip_exact_with_own_factor_rule():
 
 
 def test_quantize_gaussian_error_and_scale_bytes():
+    """Check quantize gaussian error and scale bytes."""
     w = torch.randn(256, 256, generator=torch.Generator().manual_seed(2))
     codes, scale, factor = quantize_nvfp4(w)
-    assert codes.dtype == torch.uint8 and codes.shape == (256, 128)
-    assert scale.dtype == torch.float8_e4m3fn and scale.shape == (256, 16)
-    assert factor.dtype == torch.float32 and factor.ndim == 0
+    assert codes.dtype == torch.uint8
+    assert codes.shape == (256, 128)
+    assert scale.dtype == torch.float8_e4m3fn
+    assert scale.shape == (256, 16)
+    assert factor.dtype == torch.float32
+    assert factor.ndim == 0
     raw = scale.view(torch.uint8)
     assert ((raw >= 0x01) & (raw <= 0x7E)).all()  # finite, positive, never NaN or negative
     rel = (dequantize_nvfp4(codes, scale, factor) - w).norm() / w.norm()
@@ -121,9 +130,11 @@ def test_quantize_gaussian_error_and_scale_bytes():
 
 
 def test_zero_matrix_and_zero_block():
+    """Check zero matrix and zero block."""
     codes, scale, factor = quantize_nvfp4(torch.zeros(4, 32))
     assert factor == 1.0
-    assert (codes == 0).all() and (scale.view(torch.uint8) == 0x01).all()
+    assert (codes == 0).all()
+    assert (scale.view(torch.uint8) == 0x01).all()
     assert dequantize_nvfp4(codes, scale, factor).eq(0).all()
 
     w = torch.randn(4, 64, generator=torch.Generator().manual_seed(3))
@@ -137,6 +148,7 @@ def test_zero_matrix_and_zero_block():
 
 
 def test_dequantize_mxfp8_matches_pr_formula():
+    """Check dequantize mxfp8 matches pr formula."""
     g = torch.Generator().manual_seed(4)
     experts, rows, columns = 2, 4, 64
     values = (torch.randn(experts, rows, columns, generator=g) * 4).to(torch.float8_e4m3fn)
@@ -146,14 +158,16 @@ def test_dequantize_mxfp8_matches_pr_formula():
     ref = values.float().view(*block_scale.shape, 32)
     ref = (ref * torch.exp2(block_scale - 127)[..., None]).reshape(-1, rows, columns)
     out = dequantize_mxfp8(values, scale)
-    assert out.dtype == torch.float32 and torch.equal(out, ref)
+    assert out.dtype == torch.float32
+    assert torch.equal(out, ref)
 
 
 @pytest.mark.skipif(not os.environ.get("INKLING_SNAPSHOT"), reason="set INKLING_SNAPSHOT to a checkpoint snapshot dir")
 def test_real_checkpoint_layer0_expert0_matches_reference():
-    import json
+    """Check real checkpoint layer0 expert0 matches reference."""
+    import json  # noqa: PLC0415  # lazy import in a test
 
-    from safetensors import safe_open
+    from safetensors import safe_open  # noqa: PLC0415  # lazy import in a test
 
     snap = Path(os.environ["INKLING_SNAPSHOT"])
     weight_map = json.loads((snap / "model.safetensors.index.json").read_text())["weight_map"]
@@ -168,6 +182,7 @@ def test_real_checkpoint_layer0_expert0_matches_reference():
 
 
 def test_non_uint8_integer_scale_rejected():
+    """Check non uint8 integer scale rejected."""
     codes = torch.zeros(1, 8, dtype=torch.uint8)
     for dtype in (torch.int64, torch.int32, torch.int8):
         with pytest.raises(TypeError):
@@ -184,6 +199,7 @@ def _anchored(row_values):
 
 
 def test_second_candidate_scale_chosen_when_better():
+    """Check second candidate scale chosen when better."""
     w, f = _anchored([4.0] * 16)  # /4 gives scale 1.0 and exact codes; /6 gives scale ~0.6875 and a lossy 4.125
     codes, scale, factor = quantize_nvfp4(w)
     assert factor == f
@@ -194,6 +210,7 @@ def test_second_candidate_scale_chosen_when_better():
 
 def test_tie_rules():
     # a value exactly on the midpoint between magnitudes 0 and 0.5 goes to the smaller magnitude (nibble 0)
+    """Check tie rules."""
     w, _ = _anchored([6.0, 0.25] + [0.0] * 14)
     codes, scale, _ = quantize_nvfp4(w)
     assert scale.view(torch.uint8)[1, 0] == 0x38  # equal-error candidates: /6 wins

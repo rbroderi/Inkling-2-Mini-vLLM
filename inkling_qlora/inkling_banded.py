@@ -1,5 +1,6 @@
-"""Exact banded sliding-window attention for Inkling 2 Mini, as a per-model patch (docs/inkling_general_speed.md,
-ticket A1).
+"""Exact banded sliding-window attention for Inkling 2 Mini, as a per-model patch.
+
+See docs/inkling_general_speed.md, ticket A1.
 
 The installed ``Inkling2LoopSlidingAttention.forward`` builds the relative position bias and the attention logits
 for every (query, key) pair, T x T, although a sliding layer only lets a query see itself and the
@@ -18,18 +19,19 @@ sliding call longer than the window, so generation and anything at or below 1,02
 Inkling transformers build; transformers is imported lazily in ``enable_banded_attention``.
 """
 
-from __future__ import annotations
-
 import hashlib
 import inspect
 import sys
 import types
 from collections.abc import Callable
 from typing import Any
+from typing import cast
 
 import torch
 
 BAND_CHUNK = 256
+MASK_NDIM = 4  # (batch, heads or 1, query, key)
+DISTANCE_NDIM = 2  # (query, key)
 
 # SHA-256 of ``inspect.getsource`` of the reference functions in the installed build (transformers 5.24.0.dev0 in
 # ~/inkling-venv, computed 2026-11-22): the attention and bias code the patch repeats, and the code that defines the
@@ -53,12 +55,14 @@ _HAD_INSTANCE_FORWARD_ATTR = "_banded_had_instance_forward"
 
 
 def band_start(qs: int, window: int) -> int:
-    """First key a query chunk starting at ``qs`` can see: the window holds the query itself and ``window - 1``
-    earlier keys."""
+    """Return the first key a query chunk starting at ``qs`` can see.
+
+    The window holds the query itself and ``window - 1`` earlier keys.
+    """
     return max(0, qs - window + 1)
 
 
-def banded_attention(
+def banded_attention(  # noqa: PLR0913, PLR0917  # mirrors the reference attention's inputs
     attn_fn: Callable[..., tuple[torch.Tensor, Any]],
     module: Any,
     query: torch.Tensor,
@@ -74,7 +78,7 @@ def banded_attention(
     chunk: int = BAND_CHUNK,
     **kwargs: Any,
 ) -> torch.Tensor:
-    """Sliding attention computed chunk by chunk over the keys each chunk can see.
+    """Compute sliding attention chunk by chunk over the keys each chunk can see.
 
     Shapes: ``query`` (B, H, T, D); ``key``, ``value`` (B, KVH, T, D); ``attention_mask`` (B, 1 or H, T, T),
     additive; ``relative_distance`` (T, T); ``rel_logits`` (B, H, T, extent), the per-distance bias before the
@@ -106,7 +110,11 @@ def banded_attention(
     return torch.cat(outputs, dim=1)
 
 
-def _use_original(
+def _has_hooks(module: Any) -> bool:
+    return bool(getattr(module, "_forward_hooks", None) or getattr(module, "_forward_pre_hooks", None))
+
+
+def _use_original(  # noqa: PLR0913, PLR0917  # mirrors the patched forward's inputs
     self: Any,
     hidden_states: torch.Tensor,
     attention_mask: Any,
@@ -121,10 +129,10 @@ def _use_original(
         or kwargs.get("past_key_values") is not None
         or getattr(self.config, "_attn_implementation", "eager") not in (None, "eager")
         or not isinstance(attention_mask, torch.Tensor)
-        or attention_mask.dim() != 4
+        or attention_mask.dim() != MASK_NDIM
         or tuple(attention_mask.shape[-2:]) != (t, t)
         or not isinstance(relative_distance, torch.Tensor)
-        or relative_distance.dim() != 2
+        or relative_distance.dim() != DISTANCE_NDIM
         or tuple(relative_distance.shape) != (t, t)
         or t <= self.sliding_window
         or (self.training and self.attention_dropout > 0)
@@ -134,11 +142,7 @@ def _use_original(
     )
 
 
-def _has_hooks(module: Any) -> bool:
-    return bool(getattr(module, "_forward_hooks", None) or getattr(module, "_forward_pre_hooks", None))
-
-
-def banded_sliding_forward(
+def banded_sliding_forward(  # noqa: PLR0913, PLR0917  # mirrors the reference forward's signature
     self: Any,
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor | None,
@@ -149,9 +153,12 @@ def banded_sliding_forward(
     value_hidden_states: torch.Tensor | None = None,
     cache_offset: int = 0,
     **kwargs: Any,
-) -> tuple[torch.Tensor, None]:
-    """Drop-in for ``Inkling2LoopSlidingAttention.forward`` (bound per instance by ``enable_banded_attention``).
-    Repeats the reference body with the attention done by ``banded_attention``; returns ``(attn_output, None)``."""
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Replace ``Inkling2LoopSlidingAttention.forward`` (bound per instance by ``enable_banded_attention``).
+
+    Repeats the reference body with the attention done by ``banded_attention``; returns ``(attn_output, None)``.
+    When it falls back to the original forward, that forward's ``(attn_output, attn_weights)`` is returned as is.
+    """
     if _use_original(self, hidden_states, attention_mask, relative_distance, cache, kwargs):
         return getattr(self, _ORIGINAL_ATTR)(
             hidden_states,
@@ -190,7 +197,7 @@ def banded_sliding_forward(
         query_states,
         key_states,
         value_states,
-        attention_mask,
+        cast("torch.Tensor", attention_mask),  # _use_original returned False, so it is a tensor
         relative_distance,
         rel_logits,
         sinks,
@@ -207,7 +214,7 @@ def banded_sliding_forward(
 
 
 def _reference_functions(modeling: types.ModuleType) -> dict[str, Callable[..., Any]]:
-    import transformers.masking_utils as masking_utils
+    from transformers import masking_utils  # noqa: PLC0415  # optional heavy dependency
 
     return {
         "Inkling2LoopSlidingAttention.forward": modeling.Inkling2LoopSlidingAttention.forward,
@@ -221,21 +228,24 @@ def _reference_functions(modeling: types.ModuleType) -> dict[str, Callable[..., 
 
 
 def check_reference_sources(modeling: types.ModuleType) -> None:
-    """RuntimeError unless every reference function's source hashes to its pinned value."""
+    """Raise RuntimeError unless every reference function's source hashes to its pinned value."""
     for name, fn in _reference_functions(modeling).items():
         digest = hashlib.sha256(inspect.getsource(fn).encode()).hexdigest()
         if digest != PINNED_SOURCE_SHA256[name]:
-            raise RuntimeError(
+            msg = (
                 f"banded attention: the source of {name} changed (sha256 {digest}, pinned "
                 f"{PINNED_SOURCE_SHA256[name]} for transformers {PINNED_TRANSFORMERS_VERSION}); re-check the patch "
                 "against the installed modeling_inkling2_loop.py / masking_utils.py and update the pin"
             )
+            raise RuntimeError(msg)
 
 
 def enable_banded_attention(model: torch.nn.Module) -> int:
     """Patch every sliding ``Inkling2LoopSlidingAttention`` in ``model``; return how many (20 for Inkling 2 Mini).
-    RuntimeError if the reference code changed or no module was found. Patching twice is a no-op per module."""
-    import transformers.models.inkling2_loop.modeling_inkling2_loop as modeling
+
+    RuntimeError if the reference code changed or no module was found. Patching twice is a no-op per module.
+    """
+    import transformers.models.inkling2_loop.modeling_inkling2_loop as modeling  # noqa: PLC0415  # optional heavy dependency  # pyright: ignore[reportMissingImports]
 
     check_reference_sources(modeling)
     count = 0
@@ -249,7 +259,8 @@ def enable_banded_attention(model: torch.nn.Module) -> int:
         setattr(module, _ORIGINAL_ATTR, module.forward)
         module.forward = types.MethodType(banded_sliding_forward, module)
     if count == 0:
-        raise RuntimeError("banded attention: no sliding Inkling2LoopSlidingAttention module in the model")
+        msg = "banded attention: no sliding Inkling2LoopSlidingAttention module in the model"
+        raise RuntimeError(msg)
     return count
 
 

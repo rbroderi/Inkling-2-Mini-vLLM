@@ -7,15 +7,14 @@ reverse. ``wq_du`` and ``gate_attn`` share a shape, as do ``wk_dv`` and ``wv_dv`
 shape check; the tests pin the pairs with literals.
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 import re
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
+from safetensors.torch import save_file
 
 BASE_MODEL = "thinkingmachines/Inkling-2-Mini"
 NUM_LAYERS = 24
@@ -56,52 +55,62 @@ _INVERSE = {v: k for k, v in MODULE_MAP.items()}
 
 
 def convert_key(key: str) -> str:
+    """Convert a PEFT adapter tensor key into the key vLLM expects."""
     m = PEFT_KEY.match(key)
     if not m or int(m.group(1)) >= NUM_LAYERS:
-        raise ValueError(f"cannot convert adapter key: {key}")
+        msg = f"cannot convert adapter key: {key}"
+        raise ValueError(msg)
     n, hf, ab = m.groups()
     return f"base_model.model.model.llm.layers.{int(n)}.attn.{MODULE_MAP[hf]}.lora_{ab}.weight"
 
 
 def invert_key(key: str) -> str:
+    """Convert a vLLM adapter tensor key back into the PEFT key."""
     m = CKPT_KEY.match(key)
     if not m or int(m.group(1)) >= NUM_LAYERS:
-        raise ValueError(f"cannot invert adapter key: {key}")
+        msg = f"cannot invert adapter key: {key}"
+        raise ValueError(msg)
     n, ckpt, ab = m.groups()
     return f"base_model.model.model.language_model.layers.{int(n)}.self_attn.{_INVERSE[ckpt]}.lora_{ab}.weight"
 
 
 def convert_state_dict(tensors: dict[str, torch.Tensor], r: int) -> dict[str, torch.Tensor]:
+    """Convert an adapter state dict from PEFT keys to the keys vLLM expects."""
     out: dict[str, torch.Tensor] = {}
     bad: list[str] = []
-    for key in tensors:
+    for key, tensor in tensors.items():
         try:
             new = convert_key(key)
         except ValueError:
             bad.append(key)
             continue
         if new in out:
-            raise ValueError(f"two input keys convert to {new} (second: {key})")
-        out[new] = tensors[key]
+            msg = f"two input keys convert to {new} (second: {key})"
+            raise ValueError(msg)
+        out[new] = tensor
     if bad:
         raise ValueError("unconvertible adapter keys: " + ", ".join(bad))
     if len(out) != len(tensors):
-        raise ValueError(f"converted {len(out)} tensors from {len(tensors)}")
+        msg = f"converted {len(out)} tensors from {len(tensors)}"
+        raise ValueError(msg)
     for key, t in out.items():
         m = CKPT_KEY.match(key)
-        assert m is not None
+        assert m is not None  # noqa: S101  # narrows the match type; keys were just converted
         _, ckpt, ab = m.groups()
         partner = key[: -len(f"lora_{ab}.weight")] + f"lora_{'B' if ab == 'A' else 'A'}.weight"
         if partner not in out:
-            raise ValueError(f"missing partner of {invert_key(key)}: {invert_key(partner)}")
+            msg = f"missing partner of {invert_key(key)}: {invert_key(partner)}"
+            raise ValueError(msg)
         o, i = MODULE_SHAPES[ckpt]
         want = (r, i) if ab == "A" else (o, r)
         if tuple(t.shape) != want:
-            raise ValueError(f"{invert_key(key)}: shape {tuple(t.shape)}, expected {want}")
+            msg = f"{invert_key(key)}: shape {tuple(t.shape)}, expected {want}"
+            raise ValueError(msg)
     return out
 
 
-def convert_config(cfg: dict, present: set[str]) -> dict:
+def convert_config(cfg: dict, present: set[str]) -> dict:  # noqa: C901  # a flat list of independent config checks
+    """Convert a PEFT adapter config for vLLM, rejecting settings it cannot serve."""
     problems = []
     if cfg.get("peft_type") != "LORA":
         problems.append(f"peft_type={cfg.get('peft_type')!r}")
@@ -144,11 +153,14 @@ def convert_config(cfg: dict, present: set[str]) -> dict:
 
 
 def convert_adapter(src: Path, dst: Path) -> dict:
+    """Convert a PEFT adapter directory into one vLLM can serve and return its config."""
     src, dst = Path(src), Path(dst)
     if dst.resolve() == src.resolve():
-        raise ValueError("destination must differ from the source")
+        msg = "destination must differ from the source"
+        raise ValueError(msg)
     if dst.exists() and any(dst.iterdir()):
-        raise ValueError(f"destination {dst} exists and is not empty")
+        msg = f"destination {dst} exists and is not empty"
+        raise ValueError(msg)
     weights = src / "adapter_model.safetensors"
     cfg = json.loads((src / "adapter_config.json").read_text(encoding="utf-8"))
     tensors = load_file(str(weights))
@@ -157,7 +169,7 @@ def convert_adapter(src: Path, dst: Path) -> dict:
     layers: set[int] = set()
     for key in converted:
         m = CKPT_KEY.match(key)
-        assert m is not None
+        assert m is not None  # noqa: S101  # narrows the match type; keys were just converted
         layers.add(int(m.group(1)))
         present.add(m.group(2))
     new_cfg = convert_config(cfg, present)
@@ -182,8 +194,10 @@ def convert_adapter(src: Path, dst: Path) -> dict:
     (dst / "conversion.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     written = load_file(str(dst / "adapter_model.safetensors"))
     if len(written) != len(tensors):
-        raise ValueError(f"wrote {len(written)} tensors, expected {len(tensors)}")
+        msg = f"wrote {len(written)} tensors, expected {len(tensors)}"
+        raise ValueError(msg)
     for k, t in tensors.items():
         if not torch.equal(t, written[convert_key(k)]):
-            raise ValueError(f"tensor {k} changed in conversion")
+            msg = f"tensor {k} changed in conversion"
+            raise ValueError(msg)
     return summary

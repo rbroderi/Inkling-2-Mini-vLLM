@@ -18,20 +18,24 @@ experts that received tokens, with each expert's weights dequantized on the fly,
 Needs the separate environment with transformers from PR #51050 (``~/inkling-venv``), not the judges' training env.
 """
 
-from __future__ import annotations
-
 import json
 import os
 import re
 from pathlib import Path
 from typing import Any
+from typing import cast
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812  # torch's conventional alias
 from torch import nn
 
-from inkling_qlora.inkling_kernels import SoftcappedSwiGLU, TorchBackend, fused_experts
-from inkling_qlora.inkling_nvfp4 import E2M1_VALUES, dequantize_mxfp8, quantize_nvfp4
+from inkling_qlora.inkling_banded import enable_banded_attention
+from inkling_qlora.inkling_kernels import SoftcappedSwiGLU
+from inkling_qlora.inkling_kernels import TorchBackend
+from inkling_qlora.inkling_kernels import fused_experts
+from inkling_qlora.inkling_nvfp4 import E2M1_VALUES
+from inkling_qlora.inkling_nvfp4 import dequantize_mxfp8
+from inkling_qlora.inkling_nvfp4 import quantize_nvfp4
 
 # LoRA on the language model's attention projections (the experts are frozen and quantized; the router is not a
 # Linear). A regex, so the vision tower's layers are left alone.
@@ -56,7 +60,7 @@ INKLING_REVISION = "ed40e7da625f594fc9c4990f5f66be24873c22d7"
 
 
 def inkling_revision(model_id: str) -> str | None:
-    """The pinned revision (``INKLING_REVISION`` env var, else the constant) for Inkling's repo id; None otherwise."""
+    """Return the pinned revision (``INKLING_REVISION`` env var, else the constant) for Inkling's repo id, else None."""
     if model_id != INKLING_MODEL_ID:
         return None
     return os.environ.get("INKLING_REVISION") or INKLING_REVISION
@@ -71,6 +75,7 @@ class Quant4bitExperts(nn.Module):
     """
 
     def __init__(self, config: Any) -> None:
+        """Build empty experts sized from the model ``config``; the weights are set per layer later."""
         super().__init__()
         self.num_experts = config.n_routed_experts
         self.hidden_dim = config.hidden_size
@@ -115,10 +120,10 @@ class Quant4bitExperts(nn.Module):
     @torch.no_grad()
     def set_weights(self, gate_up: torch.Tensor, down: torch.Tensor, device: torch.device | str) -> None:
         """Quantize (E, 2I, H) gate_up and (E, H, I) down bf16 weights to NF4, one expert at a time, onto ``device``."""
-        import bitsandbytes.functional as bnbf
+        import bitsandbytes.functional as bnbf  # noqa: PLC0415  # optional heavy dependency
 
-        assert gate_up.shape == (self.num_experts, 2 * self.intermediate_dim, self.hidden_dim), gate_up.shape
-        assert down.shape == (self.num_experts, self.hidden_dim, self.intermediate_dim), down.shape
+        assert gate_up.shape == (self.num_experts, 2 * self.intermediate_dim, self.hidden_dim), gate_up.shape  # noqa: S101  # shape guard
+        assert down.shape == (self.num_experts, self.hidden_dim, self.intermediate_dim), down.shape  # noqa: S101  # shape guard
         for name, weights in (("gate_up", gate_up), ("down", down)):
             states = []
             for e in range(self.num_experts):
@@ -131,23 +136,26 @@ class Quant4bitExperts(nn.Module):
         self.storage, self.loaded = "nf4", True
 
     def weight(self, name: str, e: int) -> torch.Tensor:
+        """Return expert ``e``'s ``gate_up`` or ``down`` weight dequantized to bf16."""
         if self.storage == "nf4":
-            import bitsandbytes.functional as bnbf
+            import bitsandbytes.functional as bnbf  # noqa: PLC0415  # optional heavy dependency
 
             return bnbf.dequantize_4bit(getattr(self, f"{name}_{e}"), self.quant_states[name][e]).to(torch.bfloat16)
         codes = getattr(self, f"{name}_codes")[e]  # (rows, columns / 2) bytes, low nibble first
         scale = getattr(self, f"{name}_scale")[e].float()  # (rows, columns / 16)
         rows = codes.shape[0]
-        w = self.byte_to_values[codes.long()].view(*scale.shape, 16) * scale[..., None]
+        w = cast("torch.Tensor", self.byte_to_values)[codes.long()].view(*scale.shape, 16) * scale[..., None]
         w = (w * getattr(self, f"{name}_factor")[e]).reshape(rows, -1)
         if name == "gate_up":  # the checkpoint interleaves gate and up rows; the model wants [gate; up]
             w = w.view(rows // 2, 2, -1).transpose(0, 1).reshape(rows, -1)
         return w.to(torch.bfloat16)
 
-    def _apply(self, fn: Any, recurse: bool = True) -> Any:
-        """``.to``/``.cuda``/``.half`` etc.: moves the packed buffers but never changes their dtype (uint8 codes,
-        float8 scales and float32 factors are not weights to cast), and drops the backend cache so the old device's
-        tensors are not kept alive."""
+    def _apply(self, fn: Any, recurse: bool = True) -> Any:  # noqa: FBT001, FBT002  # mirrors nn.Module._apply
+        """Handle ``.to``/``.cuda``/``.half`` etc.
+
+        Moves the packed buffers but never changes their dtype (uint8 codes, float8 scales and float32 factors are
+        not weights to cast), and drops the backend cache so the old device's tensors are not kept alive.
+        """
         packed = {
             n: b for n, b in self._buffers.items() if b is not None and n.endswith(("_codes", "_scale", "_factor"))
         }
@@ -163,29 +171,24 @@ class Quant4bitExperts(nn.Module):
         return result
 
     def _backend(self, device: torch.device) -> Any:
-        """The fused-path backend, built once over this module's own buffers (not registered, so ``.to`` is safe):
-        it is rebuilt if a buffer was replaced, e.g. by moving the module."""
+        """Return the fused-path backend, built once over this module's own buffers.
+
+        The buffers are not registered, so ``.to`` is safe; it is rebuilt if a buffer was replaced, e.g. by moving the
+        module.
+        """
         buffers = tuple(
             getattr(self, f"{name}_{part}") for name in ("gate_up", "down") for part in ("codes", "scale", "factor")
         )
         cache = self._backend_cache
         if cache is None or any(a is not b for a, b in zip(cache[0], buffers, strict=True)):
             if torch.device(device).type == "cuda":
-                from inkling_qlora.inkling_triton import TritonBackend
+                from inkling_qlora.inkling_triton import TritonBackend  # noqa: PLC0415  # imports triton
 
                 backend = TritonBackend(*buffers)
             else:
                 backend = TorchBackend(*buffers)
             cache = self._backend_cache = (buffers, backend)
         return cache[1]
-
-    def forward(
-        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
-    ) -> torch.Tensor:
-        if self.impl == "fused" and self.storage == "nvfp4":
-            backend = self._backend(hidden_states.device)
-            return fused_experts(hidden_states, top_k_index, top_k_weights, backend, self.gate_cap, self.up_cap)
-        return self._forward_loop(hidden_states, top_k_index, top_k_weights)
 
     def _forward_loop(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
@@ -207,10 +210,19 @@ class Quant4bitExperts(nn.Module):
             final.index_add_(0, token_idx, y.to(final.dtype))
         return final.to(hidden_states.dtype)
 
+    def forward(
+        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
+    ) -> torch.Tensor:
+        """Route the tokens through the grouped kernels (NVFP4 storage, ``fused``) or the per-expert loop."""
+        if self.impl == "fused" and self.storage == "nvfp4":
+            backend = self._backend(hidden_states.device)
+            return fused_experts(hidden_states, top_k_index, top_k_weights, backend, self.gate_cap, self.up_cap)
+        return self._forward_loop(hidden_states, top_k_index, top_k_weights)
+
 
 def _snapshot(model_id: str, revision: str | None = None) -> Path:
-    """The local snapshot of ``model_id`` at ``revision`` (default: the pinned ``inkling_revision``)."""
-    from huggingface_hub import snapshot_download
+    """Return the local snapshot of ``model_id`` at ``revision`` (default: the pinned ``inkling_revision``)."""
+    from huggingface_hub import snapshot_download  # noqa: PLC0415  # optional heavy dependency
 
     return Path(snapshot_download(model_id, revision=revision or inkling_revision(model_id)))
 
@@ -227,8 +239,8 @@ def expert_tensors(snapshot: Path) -> dict[int, dict[str, str]]:
 
 
 def read_layer(snapshot: Path, layer: int, files: dict[str, str], device: str) -> dict[str, torch.Tensor]:
-    """One layer's raw expert tensors from the checkpoint, keyed by suffix (``w13_weight``, ``w2_weight_scale``...)."""
-    from safetensors import safe_open
+    """Read one layer's raw expert tensors from the checkpoint, keyed by suffix (``w13_weight``, ...)."""
+    from safetensors import safe_open  # noqa: PLC0415  # optional heavy dependency
 
     parts = {}
     for name, shard in files.items():
@@ -241,9 +253,11 @@ def read_layer(snapshot: Path, layer: int, files: dict[str, str], device: str) -
 def requantize_mxfp8_to_nvfp4(
     raw: dict[str, torch.Tensor], device: torch.device | str
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """An MXFP8 layer's raw tensors (``w13_weight``, ``w13_weight_scale``, ``w2_...``, as read by ``read_layer``) as
-    NVFP4 on ``device``: per expert and projection, decoded to float32 on the device and quantized, so one expert in
-    float32 is the peak. Rows stay in checkpoint order (gate/up interleaved), as the NVFP4 layers' are."""
+    """Re-quantize an MXFP8 layer's raw tensors (as read by ``read_layer``) to NVFP4 on ``device``.
+
+    Per expert and projection, decoded to float32 on the device and quantized, so one expert in float32 is the
+    peak. Rows stay in checkpoint order (gate/up interleaved), as the NVFP4 layers' are.
+    """
     packed = {}
     for proj, name in (("w13", "gate_up"), ("w2", "down")):
         values, scales = raw[f"{proj}_weight"], raw[f"{proj}_weight_scale"]
@@ -263,8 +277,9 @@ def requantize_mxfp8_to_nvfp4(
 def dequantize_layer(
     snapshot: Path, layer: int, files: dict[str, str], device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One layer's experts as bf16 (gate_up (E, 2I, H), down (E, H, I)), through the PR's own conversion ops."""
-    from transformers.core_model_loading import Inkling2LoopDequantizeExperts, Interleave
+    """Return one layer's experts as bf16 (gate_up (E, 2I, H), down (E, H, I)), through the PR's own conversion ops."""
+    from transformers.core_model_loading import Inkling2LoopDequantizeExperts  # noqa: PLC0415  # optional heavy dependency  # pyright: ignore[reportAttributeAccessIssue]  # pyrefly: ignore[missing-module-attribute]
+    from transformers.core_model_loading import Interleave  # noqa: PLC0415  # optional heavy dependency
 
     raw = read_layer(snapshot, layer, files, device)
     out = []
@@ -283,7 +298,9 @@ class _NoVisionTower(nn.Module):
     """Stands in for the vision tower when only text is judged: no parameters, so its checkpoint weights are skipped."""
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("the vision tower was not loaded (text_only=True); images are not supported")
+        """Fail: this stand-in has no vision weights."""
+        msg = "the vision tower was not loaded (text_only=True); images are not supported"
+        raise RuntimeError(msg)
 
 
 class _TextOnlyAutoModel:
@@ -291,12 +308,15 @@ class _TextOnlyAutoModel:
 
     @staticmethod
     def from_config(*args: Any, **kwargs: Any) -> nn.Module:
+        """Return the parameter-free vision tower stand-in."""
         return _NoVisionTower()
 
 
 def _embeddings_to_cpu(embedding: nn.Embedding) -> None:
-    """Keep the (frozen) token embedding table in CPU memory and look rows up there, sending only the looked-up rows
-    to the GPU. Inkling's table is 201,024 x 2,304 (0.86 GiB in bf16); a lookup of a few thousand rows costs little.
+    """Keep the (frozen) token embedding table in CPU memory and look rows up there.
+
+    Only the looked-up rows are sent to the GPU. Inkling's table is 201,024 x 2,304 (0.86 GiB in bf16); a lookup
+    of a few thousand rows costs little.
 
     The table is held as a plain attribute, not a parameter, so ``model.parameters()`` (and so ``model.device``, which
     reads the first parameter) still points at the GPU. It is left out of ``state_dict``: fine for LoRA, which saves
@@ -314,24 +334,27 @@ def _embeddings_to_cpu(embedding: nn.Embedding) -> None:
 
     def forward(input_ids: torch.Tensor) -> torch.Tensor:
         rows = F.embedding(input_ids.to("cpu"), table, padding_idx).to(input_ids.device, non_blocking=True)
-        norm = getattr(embedding, "embed_norm", None)
+        norm: Any = getattr(embedding, "embed_norm", None)
         return norm(rows) if norm is not None else rows
 
     embedding.forward = forward  # type: ignore[method-assign]
 
 
 def resolve_experts_impl(experts_impl: str | None) -> str:
-    """``experts_impl``, or ``INKLING_EXPERTS_IMPL`` (default "fused") when None; ValueError if not a known impl."""
+    """Return ``experts_impl``, or ``INKLING_EXPERTS_IMPL`` (default "fused") when None; ValueError if unknown."""
     if experts_impl is None:
         experts_impl = os.environ.get("INKLING_EXPERTS_IMPL", "fused")
     if experts_impl not in EXPERTS_IMPLS:
-        raise ValueError(f"experts_impl must be one of {EXPERTS_IMPLS}, got {experts_impl!r}")
+        msg = f"experts_impl must be one of {EXPERTS_IMPLS}, got {experts_impl!r}"
+        raise ValueError(msg)
     return experts_impl
 
 
-def resolve_banded_attention(banded_attention: bool | None) -> bool:
-    """``banded_attention``, or ``INKLING_BANDED_ATTENTION`` ("1" on, "0" off) when None, else
-    ``BANDED_ATTENTION_DEFAULT`` when the variable is unset; ValueError for any other value."""
+def resolve_banded_attention(banded_attention: bool | None) -> bool:  # noqa: FBT001  # tests pass it positionally
+    """Return ``banded_attention``, or ``INKLING_BANDED_ATTENTION`` ("1" on, "0" off) when None.
+
+    Falls back to ``BANDED_ATTENTION_DEFAULT`` when the variable is unset; ValueError for any other value.
+    """
     if banded_attention is not None:
         return bool(banded_attention)
     value = os.environ.get("INKLING_BANDED_ATTENTION")
@@ -341,11 +364,13 @@ def resolve_banded_attention(banded_attention: bool | None) -> bool:
         return True
     if value == "0":
         return False
-    raise ValueError(f"INKLING_BANDED_ATTENTION must be '1' or '0', got {value!r}")
+    msg = f"INKLING_BANDED_ATTENTION must be '1' or '0', got {value!r}"
+    raise ValueError(msg)
 
 
-def load_inkling_4bit(
+def load_inkling_4bit(  # noqa: C901, PLR0913, PLR0915  # one linear loading recipe with keyword-only options
     model_id: str = "thinkingmachines/Inkling-2-Mini",
+    *,
     device: str = "cuda",
     layers: list[int] | None = None,
     text_only: bool = True,
@@ -355,11 +380,13 @@ def load_inkling_4bit(
     banded_attention: bool | None = None,
     **from_pretrained_kwargs: Any,
 ) -> nn.Module:
-    """The model with every expert in NF4 on ``device`` and the rest in bf16. ``layers`` limits which layers' experts
-    are loaded (a quick test); the others stay empty and must not be run. ``text_only`` (the default; judges read
-    text) leaves out the vision tower: 0.32B parameters, about 0.6 GiB of GPU memory freed for training.
-    ``embeddings_on_cpu`` (the default) keeps the token embedding table in CPU memory, another 0.86 GiB freed; the
-    output layer (``lm_head``, the same size) stays on the GPU, since every token needs all of it.
+    """Return the model with every expert quantized on ``device`` and the rest in bf16.
+
+    ``layers`` limits which layers' experts are loaded (a quick test); the others stay empty and must not be run.
+    ``text_only`` (the default; judges read text) leaves out the vision tower: 0.32B parameters, about 0.6 GiB of
+    GPU memory freed for training. ``embeddings_on_cpu`` (the default) keeps the token embedding table in CPU
+    memory, another 0.86 GiB freed; the output layer (``lm_head``, the same size) stays on the GPU, since every
+    token needs all of it.
 
     ``experts_impl`` is "loop" (the per-expert loop, the reference) or "fused" (the grouped kernels, NVFP4 layers
     only); None reads ``INKLING_EXPERTS_IMPL``, default "fused" (``INKLING_EXPERTS_IMPL=loop`` rolls back).
@@ -368,18 +395,20 @@ def load_inkling_4bit(
 
     ``banded_attention`` turns on the exact banded sliding attention (inkling_banded.py) once the model is loaded.
     None reads ``INKLING_BANDED_ATTENTION`` ("1" on, "0" off), default ``BANDED_ATTENTION_DEFAULT`` (on). It changes
-    only sequences longer than the 1,024-token window; shorter ones take the original path."""
+    only sequences longer than the 1,024-token window; shorter ones take the original path.
+    """
     experts_impl = resolve_experts_impl(experts_impl)
     banded_attention = resolve_banded_attention(banded_attention)
     if mxfp8_storage not in ("nf4", "nvfp4"):
-        raise ValueError(f"mxfp8_storage must be 'nf4' or 'nvfp4', got {mxfp8_storage!r}")
-    import transformers.models.inkling2_loop.modeling_inkling2_loop as modeling
-    from transformers import AutoModelForImageTextToText
+        msg = f"mxfp8_storage must be 'nf4' or 'nvfp4', got {mxfp8_storage!r}"
+        raise ValueError(msg)
+    import transformers.models.inkling2_loop.modeling_inkling2_loop as modeling  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+    from transformers import AutoModelForImageTextToText  # noqa: PLC0415  # optional heavy dependency
 
     original = modeling.Inkling2LoopExperts
     original_auto = modeling.AutoModel
     base = modeling.Inkling2LoopPreTrainedModel
-    original_init = base._init_weights
+    original_init = base._init_weights  # noqa: SLF001  # patched while the model is built
 
     def init_weights(self: Any, module: nn.Module) -> None:  # the experts are filled below, not initialized
         if not isinstance(module, Quant4bitExperts):
@@ -388,7 +417,7 @@ def load_inkling_4bit(
     modeling.Inkling2LoopExperts = Quant4bitExperts  # the sparse MoE block builds its experts from this name
     if text_only:
         modeling.AutoModel = _TextOnlyAutoModel  # Inkling2LoopModel builds its vision tower through AutoModel
-    base._init_weights = init_weights
+    base._init_weights = init_weights  # noqa: SLF001  # patched while the model is built
     revision = from_pretrained_kwargs.pop("revision", None) or inkling_revision(model_id)
     try:
         model = AutoModelForImageTextToText.from_pretrained(
@@ -397,9 +426,9 @@ def load_inkling_4bit(
     finally:
         modeling.Inkling2LoopExperts = original
         modeling.AutoModel = original_auto
-        base._init_weights = original_init
+        base._init_weights = original_init  # noqa: SLF001  # restore the original
     if embeddings_on_cpu and device != "cpu":
-        _embeddings_to_cpu(model.get_input_embeddings())
+        _embeddings_to_cpu(cast("nn.Embedding", model.get_input_embeddings()))
         torch.cuda.empty_cache()
     snapshot = _snapshot(model_id, revision)
     files = expert_tensors(snapshot)
@@ -408,7 +437,7 @@ def load_inkling_4bit(
         for name, mod in model.named_modules()
         if isinstance(mod, Quant4bitExperts) and (m := re.search(r"layers\.(\d+)\.mlp\.experts$", name))
     }
-    assert sorted(experts) == sorted(files), (sorted(experts), sorted(files))
+    assert sorted(experts) == sorted(files), (sorted(experts), sorted(files))  # noqa: S101  # consistency guard
     for mod in experts.values():
         mod.impl = experts_impl
     for layer in sorted(experts) if layers is None else layers:
@@ -428,7 +457,5 @@ def load_inkling_4bit(
         if device != "cpu":
             torch.cuda.empty_cache()
     if banded_attention:
-        from inkling_qlora.inkling_banded import enable_banded_attention
-
         enable_banded_attention(model)
     return model

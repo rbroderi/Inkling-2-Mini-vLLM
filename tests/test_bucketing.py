@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 from torch.utils.data import DataLoader
 
-from inkling_qlora.bucketing import BucketedSampler, padding_ratio
+from inkling_qlora.bucketing import BucketedSampler
+from inkling_qlora.bucketing import padding_ratio
 
 
 def lognormal(n=4000, seed=1):

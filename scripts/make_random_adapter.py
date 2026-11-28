@@ -17,7 +17,9 @@ from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from inkling_qlora.inkling_vllm_adapter import BASE_MODEL, MODULE_MAP, NUM_LAYERS
+from inkling_qlora.inkling_vllm_adapter import BASE_MODEL
+from inkling_qlora.inkling_vllm_adapter import MODULE_MAP
+from inkling_qlora.inkling_vllm_adapter import NUM_LAYERS
 
 DEFAULT_MODULES = "q_proj.linear,k_proj.linear,v_proj.linear,o_proj.linear,o_proj.gate_proj"
 

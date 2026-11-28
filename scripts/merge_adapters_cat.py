@@ -18,7 +18,8 @@ import shutil
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
+from safetensors.torch import save_file
 
 COPY = ("agent_config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "README.md")
 

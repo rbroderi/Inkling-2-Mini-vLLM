@@ -173,9 +173,12 @@ def main(argv: list[str] | None = None) -> Path:  # pragma: no cover - needs the
     from datasets import Dataset
     from peft import LoraConfig
     from transformers import AutoTokenizer
-    from trl import SFTConfig, SFTTrainer
+    from trl import SFTConfig
+    from trl import SFTTrainer
 
-    from inkling_qlora.inkling import INKLING_CHAT_TEMPLATE_KWARGS, INKLING_LORA_TARGETS, load_inkling_4bit
+    from inkling_qlora.inkling import INKLING_CHAT_TEMPLATE_KWARGS
+    from inkling_qlora.inkling import INKLING_LORA_TARGETS
+    from inkling_qlora.inkling import load_inkling_4bit
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     a = parse_args(argv)

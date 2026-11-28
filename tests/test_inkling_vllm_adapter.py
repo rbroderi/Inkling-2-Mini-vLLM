@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Tests for inkling vllm adapter."""
 
 import hashlib
 import importlib.util
@@ -7,17 +7,16 @@ from pathlib import Path
 
 import pytest
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
+from safetensors.torch import save_file
 
-from inkling_qlora.inkling_vllm_adapter import (
-    MODULE_MAP,
-    MODULE_SHAPES,
-    convert_adapter,
-    convert_config,
-    convert_key,
-    convert_state_dict,
-    invert_key,
-)
+from inkling_qlora.inkling_vllm_adapter import MODULE_MAP
+from inkling_qlora.inkling_vllm_adapter import MODULE_SHAPES
+from inkling_qlora.inkling_vllm_adapter import convert_adapter
+from inkling_qlora.inkling_vllm_adapter import convert_config
+from inkling_qlora.inkling_vllm_adapter import convert_key
+from inkling_qlora.inkling_vllm_adapter import convert_state_dict
+from inkling_qlora.inkling_vllm_adapter import invert_key
 
 # Literal pairs (HF name, checkpoint name), typed independently of MODULE_MAP; see
 # transformers/conversion_mapping.py lines 379-396 (inkling2 text/loop renames).
@@ -42,10 +41,12 @@ R = 4
 
 
 def peft_key(n, hf, ab):
+    """Return the PEFT state-dict key of layer ``n``, projection ``hf`` and LoRA half ``ab``."""
     return f"base_model.model.model.language_model.layers.{n}.self_attn.{hf}.lora_{ab}.weight"
 
 
 def synthetic(r=R, modules=FIVE):
+    """Return a random PEFT state dict of rank ``r`` for the projections in ``modules``."""
     t = {}
     for n in range(24):
         for hf in modules:
@@ -56,11 +57,13 @@ def synthetic(r=R, modules=FIVE):
 
 
 def test_module_map_literal():
+    """Check module map literal."""
     assert MODULE_MAP == EXPECTED
     assert MODULE_SHAPES["wq_du"] == MODULE_SHAPES["gate_attn"] == (3072, 2304)
 
 
 def test_full_adapter_converts():
+    """Check full adapter converts."""
     src = synthetic()
     out = convert_state_dict(src, R)
     expected = {
@@ -94,6 +97,7 @@ def test_full_adapter_converts():
 
 
 def test_invert_and_injective():
+    """Check invert and injective."""
     keys = [peft_key(n, hf, ab) for n in range(24) for hf in EXPECTED for ab in "AB"]
     converted = [convert_key(k) for k in keys]
     assert len(set(converted)) == len(keys) == 336
@@ -113,15 +117,15 @@ def test_invert_and_injective():
     ],
 )
 def test_bad_key_raises(mutate):
+    """Check bad key raises."""
     t = synthetic()
     mutate(t)
-    with pytest.raises(ValueError) as e:
+    with pytest.raises(ValueError, match=r"layers\.3\.mlp\.gate|layers\.24\.|vision_tower"):
         convert_state_dict(t, R)
-    msg = str(e.value)
-    assert any(s in msg for s in ("layers.3.mlp.gate", "layers.24.", "vision_tower"))
 
 
 def test_missing_b_wrong_rank_transposed():
+    """Check missing b wrong rank transposed."""
     t = synthetic()
     del t[peft_key(5, "k_proj.linear", "B")]
     with pytest.raises(ValueError, match=r"layers\.5\.self_attn\.k_proj\.linear"):
@@ -158,6 +162,7 @@ PEFT_CFG = {
 
 
 def test_convert_config_literal():
+    """Check convert config literal."""
     present = {"wq_du", "wk_dv", "wv_dv", "wo_ud", "gate_attn"}
     assert convert_config(PEFT_CFG, present) == {
         "peft_type": "LORA",
@@ -193,11 +198,13 @@ def test_convert_config_literal():
     ],
 )
 def test_convert_config_rejects(change):
-    with pytest.raises(ValueError):
+    """Check convert config rejects."""
+    with pytest.raises(ValueError, match="adapter config not supported by vLLM"):
         convert_config({**PEFT_CFG, **change}, {"wq_du"})
 
 
 def test_convert_adapter_roundtrip(tmp_path: Path):
+    """Check convert adapter roundtrip."""
     src = tmp_path / "src"
     src.mkdir()
     t = synthetic()
@@ -212,21 +219,26 @@ def test_convert_adapter_roundtrip(tmp_path: Path):
     assert summary["layers"] == list(range(24))
     assert summary["agent_config"] is None
     assert len(load_file(str(dst / "adapter_model.safetensors"))) == 240
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="exists and is not empty"):
         convert_adapter(src, dst)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="destination must differ"):
         convert_adapter(src, src)
 
 
 def test_scaled_pair(monkeypatch):
+    """Check scaled pair."""
     path = Path(__file__).resolve().parents[1] / "scripts" / "make_random_adapter.py"
     spec = importlib.util.spec_from_file_location("make_random_adapter", path)
+    assert spec is not None
+    assert spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    W = torch.randn(64, 32).to(torch.bfloat16)
-    A, B = mod.scaled_pair(W, 4, 8, 0.05, torch.Generator().manual_seed(1))
-    ratio = ((8 / 4) * (B.double() @ A.double())).norm() / W.double().norm()
+    w = torch.randn(64, 32).to(torch.bfloat16)
+    a, b = mod.scaled_pair(w, 4, 8, 0.05, torch.Generator().manual_seed(1))
+    ratio = ((8 / 4) * (b.double() @ a.double())).norm() / w.double().norm()
     assert abs(float(ratio) - 0.05) < 1e-5
-    A2, B2 = mod.scaled_pair(W, 4, 8, 0.05, torch.Generator().manual_seed(1))
-    assert torch.equal(A, A2) and torch.equal(B, B2)
-    assert A.dtype == torch.float32 and B.abs().sum() > 0
+    a2, b2 = mod.scaled_pair(w, 4, 8, 0.05, torch.Generator().manual_seed(1))
+    assert torch.equal(a, a2)
+    assert torch.equal(b, b2)
+    assert a.dtype == torch.float32
+    assert b.abs().sum() > 0

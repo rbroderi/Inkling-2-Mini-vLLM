@@ -21,15 +21,20 @@ and up rows are distinct constants; nothing written through the dfac pointer wit
 the gate_up forward with the epilogue. With K2 the forward's ``a`` comes from the kernel's tanh/sigmoid, so
 ``check_out_bit_identical`` accepts a rel difference (bf16 5e-3, the real-layer output bar; float32 1e-5) and reports
 whether ``out`` is still bit-identical.
-"""
+"""  # run as scripts, not a package
 
 import os
 import time
+from typing import Any
+from typing import cast
 
 import torch
 
-from inkling_qlora.inkling_nvfp4 import dequantize_nvfp4, e4m3_table, quantize_nvfp4
-from inkling_qlora.inkling_triton import TritonBackend, nvfp4_grouped_gemm
+from inkling_qlora.inkling_nvfp4 import dequantize_nvfp4
+from inkling_qlora.inkling_nvfp4 import e4m3_table
+from inkling_qlora.inkling_nvfp4 import quantize_nvfp4
+from inkling_qlora.inkling_triton import TritonBackend
+from inkling_qlora.inkling_triton import nvfp4_grouped_gemm
 
 INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
 DEVICE = torch.device("cpu" if INTERPRET else "cuda")
@@ -40,7 +45,23 @@ OUT_CANARY = -4096.0  # exact in bf16 and float32, far from any output value
 TAIL = 8  # extra canary rows after the last row covered by the block table
 
 
+def _gemm(*args: Any, **kwargs: Any) -> torch.Tensor:
+    """Call ``nvfp4_grouped_gemm`` without ``save_grads``: it returns one tensor."""
+    return cast("torch.Tensor", nvfp4_grouped_gemm(*args, **kwargs))
+
+
+def _tensor(result: Any) -> torch.Tensor:
+    """Narrow a backend ``gemm`` result to the tensor it is without ``save_grads``."""
+    return cast("torch.Tensor", result)
+
+
+def _pair(result: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """Narrow a backend ``gemm`` result to ``(a, dfac)``, which is what ``save_grads=True`` returns."""
+    return cast("tuple[torch.Tensor, torch.Tensor]", result)
+
+
 def rel(x: torch.Tensor, ref: torch.Tensor) -> float:
+    """Return the relative L2 error of ``x`` against ``ref``."""
     return ((x.double() - ref.double()).norm() / ref.double().norm()).item()
 
 
@@ -68,6 +89,7 @@ def block_table(counts, block_m: int, gap: int = 0):
 
 
 def make_weights(num_experts: int, rows: int, columns: int, seed: int):
+    """Return random NVFP4 expert weights: codes, scales and per-tensor factors."""
     g = torch.Generator().manual_seed(seed)
     codes, scales, factors = [], [], []
     for _ in range(num_experts):
@@ -79,7 +101,7 @@ def make_weights(num_experts: int, rows: int, columns: int, seed: int):
     return torch.stack(codes), torch.stack(scales), torch.stack(factors)
 
 
-def reference(inp, codes, scale, factor, starts, transpose, round_bf16):
+def reference(inp, codes, scale, factor, starts, transpose, round_bf16):  # noqa: PLR0913, PLR0917  # check helper, many inputs
     """float64 rows of every expert with rows, concatenated in expert order."""
     refs = []
     for e, n in enumerate(COUNTS):
@@ -98,7 +120,8 @@ def reference(inp, codes, scale, factor, starts, transpose, round_bf16):
     return torch.cat(refs)
 
 
-def check_case(weights, transpose, in_dtype, out_dtype, round_bf16, sizes, label):
+def check_case(weights, transpose, in_dtype, out_dtype, round_bf16, sizes, label):  # noqa: PLR0913, PLR0917  # check helper, many inputs
+    """Compare the Triton grouped GEMM with a float64 reference for one configuration."""
     codes, scale, factor = weights
     rows, columns = codes.shape[1], codes.shape[2] * 2
     k_dim, n_dim = (rows, columns) if transpose else (columns, rows)
@@ -107,7 +130,7 @@ def check_case(weights, transpose, in_dtype, out_dtype, round_bf16, sizes, label
     g = torch.Generator(device=DEVICE).manual_seed(1)
     # round_out=False: the T3 cases compare the raw float32 accumulator (K1 made round_out=True the default, which
     # rounds bf16-input results to bf16 before widening to a float32 output)
-    kw = dict(out_dtype=out_dtype, round_weight_bf16=round_bf16, round_out=False, **sizes)
+    kw: dict[str, Any] = dict(out_dtype=out_dtype, round_weight_bf16=round_bf16, round_out=False, **sizes)
 
     # gapped layout with canaries: 3 padding rows before every expert, plus TAIL extra rows after the last one (past
     # row P of the table). Padding rows of inp hold a finite value, so a stray load produces a finite result that
@@ -120,7 +143,7 @@ def check_case(weights, transpose, in_dtype, out_dtype, round_bf16, sizes, label
         inp[starts[e] : starts[e] + n] = torch.randn(n, k_dim, device=DEVICE, generator=g).to(in_dtype)
         valid[starts[e] : starts[e] + n] = True
     out = torch.full((total, n_dim), OUT_CANARY, device=DEVICE, dtype=out_dtype)
-    nvfp4_grouped_gemm(inp, codes, scale_u8, factor, lut, eob, row0, nrows, transpose, out=out, **kw)
+    _gemm(inp, codes, scale_u8, factor, lut, eob, row0, nrows, transpose, out=out, **kw)
     assert torch.equal(out[~valid], torch.full_like(out[~valid], OUT_CANARY)), f"{label}: padding rows were written"
     assert torch.equal(out[-TAIL:], torch.full_like(out[-TAIL:], OUT_CANARY)), f"{label}: rows past P were written"
     assert torch.isfinite(out[valid]).all(), f"{label}: valid rows not finite"
@@ -134,26 +157,28 @@ def check_case(weights, transpose, in_dtype, out_dtype, round_bf16, sizes, label
     # compact layout (out allocated by the function), run twice: bit-identical, and equal to the gapped run
     eob, row0, nrows, _, _ = block_table(COUNTS, sizes["block_m"], gap=0)
     inp_c = inp[valid].contiguous()
-    o1 = nvfp4_grouped_gemm(inp_c, codes, scale_u8, factor, lut, eob, row0, nrows, transpose, **kw)
-    o2 = nvfp4_grouped_gemm(inp_c, codes, scale_u8, factor, lut, eob, row0, nrows, transpose, **kw)
+    o1 = _gemm(inp_c, codes, scale_u8, factor, lut, eob, row0, nrows, transpose, **kw)
+    o2 = _gemm(inp_c, codes, scale_u8, factor, lut, eob, row0, nrows, transpose, **kw)
     assert torch.equal(o1, o2), f"{label}: two runs differ"
     assert torch.equal(o1, got), f"{label}: compact layout differs from the gapped layout"
     print(f"  {label}: rel {err:.2e} (bar {bar:.0e}), canaries intact, deterministic")
 
 
 def check_zero_blocks(weights):
+    """Check that the grouped GEMM on zero blocks returns an empty output without a launch."""
     codes, scale, factor = weights
     empty = torch.zeros(0, dtype=torch.int32, device=DEVICE)
     inp = torch.zeros(0, codes.shape[2] * 2, device=DEVICE)
     lut = e4m3_table(DEVICE)
-    out = nvfp4_grouped_gemm(inp, codes, scale.view(torch.uint8), factor, lut, empty, empty, empty, False)
+    out = _gemm(inp, codes, scale.view(torch.uint8), factor, lut, empty, empty, empty, False)  # noqa: FBT003  # transpose is positional in the kernel API
     assert out.shape == (0, codes.shape[1])
     print("  zero blocks: empty output, no launch")
 
 
 def check_backend_end_to_end(gu, dn, block_sizes=None):
     """TritonBackend vs TorchBackend through fused_experts: output, d(hidden), d(top_k_weights)."""
-    from inkling_qlora.inkling_kernels import TorchBackend, fused_experts
+    from inkling_qlora.inkling_kernels import TorchBackend  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora.inkling_kernels import fused_experts  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     tri, ref = TritonBackend(*gu, *dn), TorchBackend(*gu, *dn)
     block_m = 64
@@ -193,9 +218,10 @@ def _k1_routing(num_experts: int, tokens: int, k: int, seed: int):
     return index
 
 
-def check_k1_options(gu, dn, block_sizes=None):
+def check_k1_options(gu, dn, block_sizes=None):  # noqa: PLR0915  # check script, one long flow
     """Ticket K1: each new ``gemm`` option on TritonBackend against TorchBackend, plus exact structure checks."""
-    from inkling_qlora.inkling_kernels import TorchBackend, build_route_plan
+    from inkling_qlora.inkling_kernels import TorchBackend  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora.inkling_kernels import build_route_plan  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     tri, ref = TritonBackend(*gu, *dn), TorchBackend(*gu, *dn)
     if block_sizes is not None:
@@ -208,7 +234,8 @@ def check_k1_options(gu, dn, block_sizes=None):
     num_real = int((plan.block_rows > 0).sum())
     assert num_real < plan.block_rows.numel(), "the table should end in empty blocks"
     print(
-        f"  K1 plan: {tk} pairs ({tk - p} sentinel), {num_real} real + {plan.block_rows.numel() - num_real} empty blocks"
+        f"  K1 plan: {tk} pairs ({tk - p} sentinel), "
+        f"{num_real} real + {plan.block_rows.numel() - num_real} empty blocks"
     )
     dest = (2 * plan.slot + 1).to(torch.int32)  # scattered rows with a canary row between any two
     num_out = 2 * tk + 3
@@ -230,32 +257,34 @@ def check_k1_options(gu, dn, block_sizes=None):
             (torch.bfloat16, torch.float32, False),
         ]
     g = torch.Generator(device=DEVICE).manual_seed(5)
+    scale = torch.empty(0, device=DEVICE)  # reassigned in the loop below (k_dims is never empty)
     for (proj, transpose), k_dim in k_dims.items():
         src = torch.randn(tokens, k_dim, device=DEVICE, generator=g)
         scale = torch.rand(tk, device=DEVICE, generator=g) + 0.5
         for in_dtype, out_dtype, round_out in io:
             x = src.to(in_dtype)
             gathered = x.index_select(0, plan.token_idx)
-            kw = dict(out_dtype=out_dtype, round_out=round_out)
+            kw: dict[str, Any] = {"out_dtype": out_dtype, "round_out": round_out}
             exact = out_dtype == torch.float32 and not (in_dtype == torch.bfloat16 and round_out)
             bar = (1e-6 if INTERPRET else 1e-5) if exact else 2e-3
             label = (
                 f"{proj} T={int(transpose)} in={str(in_dtype)[6:]} out={str(out_dtype)[6:]} round_out={int(round_out)}"
             )
-            cases = {
+            cases: dict[str, tuple[torch.Tensor, dict[str, Any]]] = {
                 "plain": (gathered, {}),
-                "in_rows": (x, dict(in_rows=plan.token_idx32)),
-                "out_rows": (gathered, dict(out_rows=dest, num_out_rows=num_out)),
-                "all": (x, dict(in_rows=plan.token_idx32, out_rows=dest, num_out_rows=num_out)),
+                "in_rows": (x, {"in_rows": plan.token_idx32}),
+                "out_rows": (gathered, {"out_rows": dest, "num_out_rows": num_out}),
+                "all": (x, {"in_rows": plan.token_idx32, "out_rows": dest, "num_out_rows": num_out}),
             }
             if out_dtype == torch.float32:
-                cases["row_scale"] = (gathered, dict(row_scale=scale))
+                cases["row_scale"] = (gathered, {"row_scale": scale})
                 cases["all"][1]["row_scale"] = scale
             got, worst = {}, 0.0
             for name, (inp, opts) in cases.items():
-                a = tri.gemm(inp, proj, transpose, plan, **kw, **opts)
-                b = ref.gemm(inp, proj, transpose, plan, **kw, **opts)
-                assert a.dtype == b.dtype == out_dtype and a.shape == b.shape, f"{label} {name}: dtype/shape"
+                a = _tensor(tri.gemm(inp, proj, transpose, plan, **kw, **opts))
+                b = _tensor(ref.gemm(inp, proj, transpose, plan, **kw, **opts))
+                assert a.dtype == b.dtype == out_dtype, f"{label} {name}: dtype/shape"
+                assert a.shape == b.shape, f"{label} {name}: dtype/shape"
                 err = rel(a, b)
                 assert err <= bar, f"{label} {name}: rel {err:.3e} > {bar}"
                 got[name] = a
@@ -276,7 +305,7 @@ def check_k1_options(gu, dn, block_sizes=None):
             codes, scale_u8, factor = tri.weights[proj]
             canary = torch.full((num_out, sc.shape[1]), OUT_CANARY, device=DEVICE, dtype=out_dtype)
             sizes = tri.block_sizes[(proj, transpose)]
-            nvfp4_grouped_gemm(
+            _gemm(
                 x, codes, scale_u8, factor, tri.e4m3_lut, plan.expert_of_block, plan.block_row0, plan.block_rows,
                 transpose, out=canary, in_rows=plan.token_idx32, out_rows=dest, num_out_rows=num_out,
                 round_weight_bf16=in_dtype == torch.bfloat16, **kw, **sizes,
@@ -284,7 +313,8 @@ def check_k1_options(gu, dn, block_sizes=None):
             assert torch.equal(canary[~written], torch.full_like(canary[~written], OUT_CANARY)), f"{label}: canary hit"
             assert torch.equal(canary[written], sc[written]), f"{label}: canary run differs"
             print(
-                f"  K1 {label}: {', '.join(got)} vs TorchBackend max rel {worst:.2e} (bar {bar:.0e}); exact, canaries intact"
+                f"  K1 {label}: {', '.join(got)} vs TorchBackend max rel {worst:.2e} (bar {bar:.0e}); "
+                "exact, canaries intact"
             )
 
     # all-sentinel routing: every block of the static table is empty, nothing is decoded or stored
@@ -294,19 +324,20 @@ def check_k1_options(gu, dn, block_sizes=None):
     canary = torch.full((tk, h_size), OUT_CANARY, device=DEVICE)
     x = torch.randn(tk, i_size, device=DEVICE, generator=g)
     sizes = tri.block_sizes[("down", False)]
-    nvfp4_grouped_gemm(
-        x, codes, scale_u8, factor, tri.e4m3_lut, empty.expert_of_block, empty.block_row0, empty.block_rows, False,
+    _gemm(
+        x, codes, scale_u8, factor, tri.e4m3_lut, empty.expert_of_block, empty.block_row0, empty.block_rows, False,  # noqa: FBT003  # transpose is positional in the kernel API
         out=canary, round_weight_bf16=False, **sizes,
     )  # fmt: skip
     assert torch.equal(canary, torch.full_like(canary, OUT_CANARY)), "an empty block stored"
-    zeros = tri.gemm(x, "down", False, empty, out_rows=empty.slot32, num_out_rows=tk, row_scale=scale)
+    zeros = _tensor(tri.gemm(x, "down", False, empty, out_rows=empty.slot32, num_out_rows=tk, row_scale=scale))  # noqa: FBT003  # transpose is positional in the kernel API
     assert torch.equal(zeros, torch.zeros_like(zeros)), "all-sentinel output not zero"
     print("  K1 all-sentinel plan: no block stores, output exact zeros")
 
 
 def _swiglu_ref(gu64: torch.Tensor, gate_cap: float = 4.0, up_cap: float = 25.0):
     """float64 (a, dfac interleaved) from float64 gu with gate = even, up = odd columns."""
-    from inkling_qlora.inkling_kernels import SoftcappedSwiGLU, softcapped_swiglu_grads
+    from inkling_qlora.inkling_kernels import SoftcappedSwiGLU  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora.inkling_kernels import softcapped_swiglu_grads  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     gate, up = gu64[:, 0::2], gu64[:, 1::2]
     a = SoftcappedSwiGLU(gate_cap, up_cap)(gate, up)
@@ -331,8 +362,10 @@ def frac_over_1ulp(x: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 def _round_bf16(t: torch.Tensor) -> torch.Tensor:
-    """float32 -> bf16 -> float32 as the kernel casts: round to nearest even on the GPU, truncation in Triton 3.8's
-    interpreter."""
+    """Round float32 to bf16 and back as the kernel casts.
+
+    Round to nearest even on the GPU, truncation in Triton 3.8's interpreter.
+    """
     t = t.float()
     if INTERPRET:
         return (t.contiguous().view(torch.int32) & -65536).view(torch.float32)
@@ -340,13 +373,17 @@ def _round_bf16(t: torch.Tensor) -> torch.Tensor:
 
 
 def check_k2_bf16_rounding(gu, block_sizes=None):
-    """Ticket K2: the bf16 epilogue's rounding points (gu rounded to bf16 before the activation, ``a`` stored as bf16),
-    checked in units of bf16 ulps. Runs the kernel directly with float32 input holding bf16 values and bf16 rounding
-    and output switched on, which the interpreter can execute (it has no bf16 dot); float32 products of bf16 values
-    are exact, so this is the bf16 path up to the summation order. Reference: float64 GEMM with bf16 weights, then
-    the kernel's casts (``_round_bf16``) around a float32 SoftcappedSwiGLU."""
-    from inkling_qlora.inkling_kernels import SoftcappedSwiGLU, build_route_plan
-    from inkling_qlora.inkling_triton import _nvfp4_grouped_gemm_kernel
+    """Check ticket K2: the bf16 epilogue's rounding points, in units of bf16 ulps.
+
+    The points are gu rounded to bf16 before the activation and ``a`` stored as bf16. Runs the kernel directly
+    with float32 input holding bf16 values and bf16 rounding and output switched on, which the interpreter can
+    execute (it has no bf16 dot); float32 products of bf16 values are exact, so this is the bf16 path up to the
+    summation order. Reference: float64 GEMM with bf16 weights, then the kernel's casts (``_round_bf16``) around a
+    float32 SoftcappedSwiGLU.
+    """
+    from inkling_qlora.inkling_kernels import SoftcappedSwiGLU  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora.inkling_kernels import build_route_plan  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora.inkling_triton import _nvfp4_grouped_gemm_kernel  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     codes, scale, factor = gu
     num_experts, i2, h_size = codes.shape[0], codes.shape[1], codes.shape[2] * 2
@@ -360,7 +397,7 @@ def check_k2_bf16_rounding(gu, block_sizes=None):
         out = torch.zeros(tokens * k, i2 // 2, dtype=torch.bfloat16, device=DEVICE)
         dummy = plan.block_rows
         grid = (plan.block_rows.numel(), i2 // sizes["block_n"])
-        _nvfp4_grouped_gemm_kernel[grid](
+        _nvfp4_grouped_gemm_kernel[grid](  # pyright: ignore[reportIndexIssue]
             x, codes, scale.view(torch.uint8), factor, e4m3_table(DEVICE), out,
             plan.expert_of_block, plan.block_row0, plan.block_rows, plan.token_idx32, dummy, dummy, dummy, 4.0, 25.0,
             R=i2, C=h_size, BLOCK_M=sizes["block_m"], BLOCK_N=sizes["block_n"], BLOCK_K=sizes["block_k"],
@@ -389,9 +426,10 @@ def check_k2_bf16_rounding(gu, block_sizes=None):
         )
 
 
-def check_k2_act(gu, dn, block_sizes=None):
+def check_k2_act(gu, dn, block_sizes=None):  # noqa: C901, PLR0915  # check script, one long flow
     """Ticket K2: the gate_up gemm with the SwiGLU epilogue (``act``, ``save_grads``) against TorchBackend."""
-    from inkling_qlora.inkling_kernels import TorchBackend, build_route_plan
+    from inkling_qlora.inkling_kernels import TorchBackend  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora.inkling_kernels import build_route_plan  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     caps = (4.0, 25.0)
     tri, ref = TritonBackend(*gu, *dn), TorchBackend(*gu, *dn)
@@ -412,13 +450,18 @@ def check_k2_act(gu, dn, block_sizes=None):
     for dtype, mult in cases:
         x = (src * mult).to(dtype)
         table_before = plan.block_rows.clone()
-        a_t, none_t = tri.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32, act=caps)
+        a_t, none_t = cast(
+            "tuple[torch.Tensor, None]",
+            tri.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32, act=caps),  # noqa: FBT003  # transpose is positional in the kernel API
+        )
         assert none_t is None, "save_grads=False returned dfac"
         # the dfac pointer receives block_rows as a dummy when save_grads is False: it must stay untouched
         assert torch.equal(plan.block_rows, table_before), "something was written through the dfac pointer"
-        a_t2, dfac_t = tri.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32, act=caps, save_grads=True)
-        a_r, dfac_r = ref.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32, act=caps, save_grads=True)
-        assert a_t.dtype == dtype and a_t.shape == (tokens * k, i2 // 2) and dfac_t.shape == (tokens * k, i2)
+        a_t2, dfac_t = _pair(tri.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32, act=caps, save_grads=True))  # noqa: FBT003  # transpose is positional in the kernel API
+        a_r, dfac_r = _pair(ref.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32, act=caps, save_grads=True))  # noqa: FBT003  # transpose is positional in the kernel API
+        assert a_t.dtype == dtype
+        assert a_t.shape == (tokens * k, i2 // 2)
+        assert dfac_t.shape == (tokens * k, i2)
         assert torch.equal(a_t, a_t2), "a differs between save_grads=False and True"
         assert torch.equal(a_t[p:], torch.zeros_like(a_t[p:])), "sentinel rows of a not zero"
         assert torch.equal(dfac_t[p:], torch.zeros_like(dfac_t[p:])), "sentinel rows of dfac not zero"
@@ -433,7 +476,7 @@ def check_k2_act(gu, dn, block_sizes=None):
         assert err_a <= bar_a, f"{label}: a rel {err_a:.3e} > {bar_a}"
         assert err_d <= bar_d, f"{label}: dfac rel {err_d:.3e} > {bar_d}"
         assert max(err_g, err_u) <= bar_d, f"{label}: dfac gate/up halves rel {err_g:.3e}/{err_u:.3e} > {bar_d}"
-        gu_r = ref.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32)
+        gu_r = _tensor(ref.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32))  # noqa: FBT003  # transpose is positional in the kernel API
         sat = float((gu_r[:p, 0::2].float().abs() > 8).float().mean())
         ulp = ""
         if dtype == torch.bfloat16:  # the rel bars cannot see a dropped rounding point; one-ulp counts can
@@ -447,7 +490,7 @@ def check_k2_act(gu, dn, block_sizes=None):
 
     # column mapping: every expert's gate rows hold one constant and its up rows another, so a, d/dgate and d/dup
     # each depend on which half is which. Reference from the dense dequantized weight, float64.
-    from inkling_qlora.inkling_nvfp4 import quantize_nvfp4
+    from inkling_qlora.inkling_nvfp4 import quantize_nvfp4  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     num_experts = tri.num_experts
     codes, scales, factors = [], [], []
@@ -466,19 +509,21 @@ def check_k2_act(gu, dn, block_sizes=None):
             tri_c.block_sizes[key] = dict(block_sizes)
     rowsum = torch.linspace(-3.0, 3.0, tokens, device=DEVICE)
     x = (rowsum[:, None] / h_size).expand(tokens, h_size).contiguous() + 0.02 * src  # distinct per-row gate and up
-    a_t, dfac_t = tri_c.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32, act=caps, save_grads=True)
+    a_t, dfac_t = _pair(tri_c.gemm(x, "gate_up", False, plan, in_rows=plan.token_idx32, act=caps, save_grads=True))  # noqa: FBT003  # transpose is positional in the kernel API
     gu64 = torch.zeros(tokens * k, i2, dtype=torch.float64, device=DEVICE)
     expert_of_row = torch.repeat_interleave(torch.arange(num_experts, device=DEVICE), plan.counts)
     for e in range(num_experts):
         rows = (expert_of_row == e).nonzero().flatten()
         if rows.numel():
-            w = dequantize_nvfp4(*(t[e] for t in const)).double()
+            w = dequantize_nvfp4(const[0][e], const[1][e], const[2][e]).double()
             gu64[rows] = x[plan.token_idx[rows]].double() @ w.T
     a_ref, dfac_ref = _swiglu_ref(gu64)
     a_swap, dfac_swap = _swiglu_ref(gu64.view(-1, i2 // 2, 2).flip(-1).reshape(gu64.shape))
     err_a, err_d = rel(a_t, a_ref), rel(dfac_t, dfac_ref)
-    assert err_a <= 1e-5 and err_d <= 1e-5, f"K2 column mapping: a rel {err_a:.3e}, dfac rel {err_d:.3e} > 1e-5"
-    assert rel(a_t, a_swap) > 1e-2 and rel(dfac_t, dfac_swap) > 1e-2, "K2 column mapping test cannot see a swap"
+    assert err_a <= 1e-5, f"K2 column mapping: a rel {err_a:.3e}, dfac rel {err_d:.3e} > 1e-5"
+    assert err_d <= 1e-5, f"K2 column mapping: a rel {err_a:.3e}, dfac rel {err_d:.3e} > 1e-5"
+    assert rel(a_t, a_swap) > 1e-2, "K2 column mapping test cannot see a swap"
+    assert rel(dfac_t, dfac_swap) > 1e-2, "K2 column mapping test cannot see a swap"
     print(f"  K2 column mapping (distinct gate/up constants, float32): a rel {err_a:.2e}, dfac rel {err_d:.2e}")
 
 
@@ -487,21 +532,25 @@ def _pre_k1_gemm():
     path = os.environ.get("K1_OLD_TRITON")
     if not path:
         return None
-    import importlib.util
+    import importlib.util  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     spec = importlib.util.spec_from_file_location("inkling_triton_pre_k1", path)
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.nvfp4_grouped_gemm
 
 
 def _old_forward_pre_k1(hidden, top_k_index, top_k_weights, tri, block_m):
-    """Local copy of the pre-K1 ``_forward`` + ``_combine`` + plan (bincount, repeat_interleave, a gathered copy, a
-    rounded y, the weight multiply and the slot copy in torch).
+    """Return a local copy of the pre-K1 ``_forward`` + ``_combine`` + plan.
+
+    It uses bincount, repeat_interleave, a gathered copy, a rounded y, the weight multiply and the slot copy in torch.
 
     The GEMMs use the pre-K1 kernel when ``K1_OLD_TRITON`` names a saved copy of the pre-K1 ``inkling_triton.py``
     (loaded under another module name). Without it they use the new kernel in its plain mode (no gather, scatter or
-    scale), so a regression shared by the plain mode of both sides would not show here."""
+    scale), so a regression shared by the plain mode of both sides would not show here.
+    """
     old_gemm_fn = _pre_k1_gemm() or nvfp4_grouped_gemm
     num_experts, k = tri.num_experts, top_k_index.shape[1]
     d, f = hidden.dtype, torch.float32
@@ -521,8 +570,19 @@ def _old_forward_pre_k1(hidden, top_k_index, top_k_weights, tri, block_m):
         codes, scale_u8, factor = tri.weights[proj]
         sizes = tri.block_sizes[(proj, False)]
         bf16 = x.dtype == torch.bfloat16
-        return old_gemm_fn(
-            x.contiguous(), codes, scale_u8, factor, tri.e4m3_lut, *table, False, round_weight_bf16=bf16, **sizes
+        return cast(
+            "torch.Tensor",
+            old_gemm_fn(
+                x.contiguous(),
+                codes,
+                scale_u8,
+                factor,
+                tri.e4m3_lut,
+                *table,
+                False,  # noqa: FBT003  # transpose is positional in the kernel API
+                round_weight_bf16=bf16,
+                **sizes,
+            ),
         )
 
     xs = hidden.index_select(0, token_idx)
@@ -538,10 +598,13 @@ def _old_forward_pre_k1(hidden, top_k_index, top_k_weights, tri, block_m):
 
 
 def check_out_bit_identical(block_sizes=None):
-    """Ticket K1: the new forward's ``out`` equals the pre-K1 forward exactly (GPU: bf16, layer-0 shapes, 4,192 rows
-    with sentinels; interpreter: float32, small shapes). K2 computes the SwiGLU in the kernel (a different tanh and
-    sigmoid), so the bar is now rel <= 5e-3 (bf16) / 1e-5 (float32); bit-identity is reported, not required."""
-    from inkling_qlora.inkling_kernels import fused_experts
+    """Check ticket K1: the new forward's ``out`` equals the pre-K1 forward exactly.
+
+    GPU: bf16, layer-0 shapes, 4,192 rows with sentinels; interpreter: float32, small shapes.
+    K2 computes the SwiGLU in the kernel (a different tanh and sigmoid), so the bar is now rel <= 5e-3 (bf16) /
+    1e-5 (float32); bit-identity is reported, not required.
+    """
+    from inkling_qlora.inkling_kernels import fused_experts  # noqa: PLC0415  # heavy GPU dependency, lazy
 
     if INTERPRET:
         num_experts, i_size, h_size, tokens, dtype = 8, 32, 64, 40, torch.float32
@@ -600,7 +663,7 @@ def time_real_shapes():
             if name == "gate_up" and not transpose:
                 # K2: the same call with the SwiGLU epilogue, without and with the derivative factors
                 for save_grads in (False, True):
-                    kw = dict(act=(4.0, 25.0), save_grads=save_grads)
+                    kw: dict[str, Any] = {"act": (4.0, 25.0), "save_grads": save_grads}
                     for _ in range(3):
                         nvfp4_grouped_gemm(*args, **kw)
                     torch.cuda.synchronize()
@@ -614,18 +677,19 @@ def time_real_shapes():
 
 
 def main() -> None:
+    """Run every kernel check for the active mode (GPU or Triton interpreter)."""
     if not INTERPRET:
         torch.backends.cuda.matmul.allow_tf32 = False
     shapes = [(128, 64), (64, 128)] if INTERPRET else [(128, 64), (2304, 2304), (2304, 1152)]
     if INTERPRET:
         configs = [
-            dict(block_m=16, block_n=64, block_k=32, num_warps=4, num_stages=1),
-            dict(block_m=32, block_n=32, block_k=16, num_warps=4, num_stages=1),
+            {"block_m": 16, "block_n": 64, "block_k": 32, "num_warps": 4, "num_stages": 1},
+            {"block_m": 32, "block_n": 32, "block_k": 16, "num_warps": 4, "num_stages": 1},
         ]
     else:
         configs = [
-            dict(block_m=64, block_n=64, block_k=32, num_warps=4, num_stages=3),
-            dict(block_m=32, block_n=128, block_k=64, num_warps=8, num_stages=3),
+            {"block_m": 64, "block_n": 64, "block_k": 32, "num_warps": 4, "num_stages": 3},
+            {"block_m": 32, "block_n": 128, "block_k": 64, "num_warps": 8, "num_stages": 3},
         ]
     io = [(torch.float32, torch.float32, True), (torch.float32, torch.float32, False)]
     if not INTERPRET:  # bf16 comparisons are GPU-only (the interpreter has no bf16 dot)
@@ -649,7 +713,7 @@ def main() -> None:
     i_size, h_size = (32, 64) if INTERPRET else (1152, 2304)
     gu = make_weights(len(COUNTS), 2 * i_size, h_size, seed=11)
     dn = make_weights(len(COUNTS), h_size, i_size, seed=12)
-    small = dict(block_m=16, block_n=32, block_k=32, num_warps=4, num_stages=1) if INTERPRET else None
+    small = {"block_m": 16, "block_n": 32, "block_k": 32, "num_warps": 4, "num_stages": 1} if INTERPRET else None
     check_backend_end_to_end(gu, dn, small)
     check_k1_options(gu, dn, small)
     check_k2_act(gu, dn, small)

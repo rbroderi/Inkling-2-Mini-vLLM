@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import random
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
+from collections.abc import Sequence
 
 from torch.utils.data import Sampler
 

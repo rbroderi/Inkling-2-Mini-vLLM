@@ -1,5 +1,6 @@
-"""Triton grouped GEMM over NVFP4 expert weights with in-register decode, and the ``TritonBackend`` for
-``inkling_kernels.fused_experts`` (docs/inkling_fused_experts_plan.md, sections 2.1 and 2.4).
+"""Triton grouped GEMM over NVFP4 expert weights with in-register decode, and the ``TritonBackend``.
+
+The backend serves ``inkling_kernels.fused_experts`` (docs/inkling_fused_experts_plan.md, sections 2.1 and 2.4).
 
 Imported lazily, only on the CUDA fused path (it imports Triton). Under ``TRITON_INTERPRET=1`` it also accepts CPU
 tensors, which is how the kernel is checked without a GPU.
@@ -18,21 +19,25 @@ of ``gu``. ``tanh`` is libdevice's on the GPU; under ``TRITON_INTERPRET=1`` (cho
 ``2 * sigmoid(2x) - 1``, which is less accurate for tiny arguments and only meant for CPU checks.
 """
 
-from __future__ import annotations
-
 import os
+from typing import Any
+from typing import no_type_check
 
 import torch
-import triton
-import triton.language as tl
-from triton.language.extra import libdevice
+import triton  # pyright: ignore[reportMissingImports]
+import triton.language as tl  # pyright: ignore[reportMissingImports]
+from triton.language.extra import libdevice  # pyright: ignore[reportMissingImports]
 
 from inkling_qlora.inkling_kernels import check_gemm_options
-from inkling_qlora.inkling_nvfp4 import NVFP4_BLOCK, e4m3_table
+from inkling_qlora.inkling_nvfp4 import NVFP4_BLOCK
+from inkling_qlora.inkling_nvfp4 import e4m3_table
 
 # Start values (section 2.4), the nvfp4_grouped_gemm defaults.
 DEFAULT_BLOCK_SIZES = {"block_m": 64, "block_n": 64, "block_k": 32, "num_warps": 4, "num_stages": 3}
 _PROJECTIONS = ("gate_up", "down")
+CODES_NDIM = 3  # codes are (experts, rows, columns / 2)
+INP_NDIM = 2  # inp is (rows, columns)
+E4M3_TABLE_SIZE = 256  # one entry per e4m3 byte
 # Tuned by gpu_checks/tune_blocks.py (T5, 2026-11-22, RTX 3090, layer 0, 6,000 rows over 128 experts, bf16). block_m
 # stays 64, the routing plan's default block_m (BLOCK_M must be >= it; at 32 or 128 the per-example cost was higher).
 TUNED_BLOCK_SIZES: dict[tuple[str, bool], dict[str, int]] = {
@@ -48,18 +53,21 @@ _INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
 if _INTERPRET:
 
     @triton.jit
+    @no_type_check  # beartype must not wrap a Triton kernel (it compiles the function's source)
     def _tanh(x):
         return 2 * tl.sigmoid(2 * x) - 1
 
 else:
 
     @triton.jit
+    @no_type_check  # beartype must not wrap a Triton kernel (it compiles the function's source)
     def _tanh(x):
         return libdevice.tanh(x)
 
 
 @triton.jit
-def _decode_tile(b, sb, lut_ptr, factor, ROWS: tl.constexpr, COLS: tl.constexpr):
+@no_type_check  # beartype must not wrap a Triton kernel (it compiles the function's source)
+def _decode_tile(b, sb, lut_ptr, factor, ROWS: tl.constexpr, COLS: tl.constexpr):  # noqa: N803, PLR0913, PLR0917  # Triton constexpr naming; kernel signature
     """Decode a [ROWS, COLS] weight tile in float32.
 
     ``b``: int32 [ROWS, COLS // 2] code bytes (even column in the low nibble); ``sb``: int32 [ROWS, COLS // 16] e4m3
@@ -79,7 +87,8 @@ def _decode_tile(b, sb, lut_ptr, factor, ROWS: tl.constexpr, COLS: tl.constexpr)
 
 
 @triton.jit
-def _nvfp4_grouped_gemm_kernel(
+@no_type_check  # beartype must not wrap a Triton kernel (it compiles the function's source)
+def _nvfp4_grouped_gemm_kernel(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917  # Triton kernel: flat argument list and branches
     inp_ptr,
     codes_ptr,
     scale_ptr,
@@ -95,21 +104,21 @@ def _nvfp4_grouped_gemm_kernel(
     dfac_ptr,
     gate_cap,
     up_cap,
-    R: tl.constexpr,
-    C: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    TRANSPOSE: tl.constexpr,
-    OUT_BF16: tl.constexpr,
-    IN_FP32: tl.constexpr,
-    ROUND_W_BF16: tl.constexpr,
-    GATHER_IN: tl.constexpr,
-    SCATTER_OUT: tl.constexpr,
-    HAS_ROW_SCALE: tl.constexpr,
-    ROUND_OUT_BF16: tl.constexpr,
-    ACT: tl.constexpr,
-    SAVE_GRADS: tl.constexpr,
+    R: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    C: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    BLOCK_M: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    BLOCK_N: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    BLOCK_K: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    TRANSPOSE: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    OUT_BF16: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    IN_FP32: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    ROUND_W_BF16: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    GATHER_IN: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    SCATTER_OUT: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    HAS_ROW_SCALE: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    ROUND_OUT_BF16: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    ACT: tl.constexpr,  # noqa: N803  # Triton constexpr naming
+    SAVE_GRADS: tl.constexpr,  # noqa: N803  # Triton constexpr naming
 ):
     pid_b = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -120,11 +129,11 @@ def _nvfp4_grouped_gemm_kernel(
         offs_m = tl.arange(0, BLOCK_M)
         mask_m = offs_m < nrows
         rows = row0 + offs_m  # plan rows, int64
-        if GATHER_IN:  # plan row p reads input row in_rows[p]; padded rows of a partial block read row 0, masked
+        if GATHER_IN:  # plan row p reads input row in_rows[p]; padded rows of a partial block read row 0, masked  # noqa: SIM108  # Triton JIT: keep explicit if/else
             in_r = tl.load(in_rows_ptr + rows, mask=mask_m, other=0).to(tl.int64)
         else:
             in_r = rows
-        if SCATTER_OUT:  # plan row p writes output row out_rows[p]
+        if SCATTER_OUT:  # plan row p writes output row out_rows[p]  # noqa: SIM108  # Triton JIT: keep explicit if/else
             out_r = tl.load(out_rows_ptr + rows, mask=mask_m, other=0).to(tl.int64)
         else:
             out_r = rows
@@ -204,12 +213,14 @@ def _nvfp4_grouped_gemm_kernel(
 
 def _check_device(t: torch.Tensor, name: str, device: torch.device) -> None:
     if t.device != device:
-        raise ValueError(f"{name} is on {t.device}, expected {device}")
+        msg = f"{name} is on {t.device}, expected {device}"
+        raise ValueError(msg)
     if not t.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
+        msg = f"{name} must be contiguous"
+        raise ValueError(msg)
 
 
-def nvfp4_grouped_gemm(
+def nvfp4_grouped_gemm(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917  # validation and launch of one kernel
     inp: torch.Tensor,
     codes: torch.Tensor,
     scale_u8: torch.Tensor,
@@ -218,7 +229,7 @@ def nvfp4_grouped_gemm(
     expert_of_block: torch.Tensor,
     block_row0: torch.Tensor,
     block_rows: torch.Tensor,
-    transpose: bool,
+    transpose: bool,  # noqa: FBT001  # callers pass it positionally
     out_dtype: torch.dtype | None = None,
     block_m: int = 64,
     block_n: int = 64,
@@ -237,7 +248,7 @@ def nvfp4_grouped_gemm(
     save_grads: bool = False,
     dfac: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
-    """Grouped GEMM of the plan rows with the NVFP4 weight of each row's expert (see the module docstring).
+    """Multiply the plan rows by the NVFP4 weight of each row's expert (see the module docstring).
 
     ``inp`` (rows, K_dim) contiguous bf16 or float32; ``codes`` uint8 (E, R, C/2); ``scale_u8`` uint8 (E, R, C/16),
     the e4m3 bytes; ``factor`` float32 (E,); ``e4m3_lut`` float32 (256,) from ``e4m3_table``; the block table (int32)
@@ -268,28 +279,36 @@ def nvfp4_grouped_gemm(
     ``(out, dfac or None)``.
     """
     if inp.dtype not in (torch.bfloat16, torch.float32):
-        raise TypeError(f"inp must be bfloat16 or float32, got {inp.dtype}")
+        msg = f"inp must be bfloat16 or float32, got {inp.dtype}"
+        raise TypeError(msg)
     out_dtype = inp.dtype if out_dtype is None else out_dtype
     if out_dtype not in (torch.bfloat16, torch.float32):
-        raise TypeError(f"out_dtype must be bfloat16 or float32, got {out_dtype}")
+        msg = f"out_dtype must be bfloat16 or float32, got {out_dtype}"
+        raise TypeError(msg)
     device = inp.device
     if device.type != "cuda" and os.environ.get("TRITON_INTERPRET") != "1":
-        raise ValueError(f"inp must be on CUDA (or run with TRITON_INTERPRET=1), got {device}")
-    if codes.dtype != torch.uint8 or codes.dim() != 3:
-        raise TypeError(f"codes must be uint8 (E, R, C/2), got {codes.dtype} {tuple(codes.shape)}")
+        msg = f"inp must be on CUDA (or run with TRITON_INTERPRET=1), got {device}"
+        raise ValueError(msg)
+    if codes.dtype != torch.uint8 or codes.dim() != CODES_NDIM:
+        msg = f"codes must be uint8 (E, R, C/2), got {codes.dtype} {tuple(codes.shape)}"
+        raise TypeError(msg)
     num_experts, rows, columns = codes.shape[0], codes.shape[1], codes.shape[2] * 2
     if scale_u8.dtype != torch.uint8 or tuple(scale_u8.shape) != (num_experts, rows, columns // NVFP4_BLOCK):
-        raise TypeError(
+        msg = (
             f"scale_u8 must be uint8 {(num_experts, rows, columns // NVFP4_BLOCK)}, got {scale_u8.dtype} "
             f"{tuple(scale_u8.shape)}"
         )
+        raise TypeError(msg)
     if factor.dtype != torch.float32 or factor.numel() != num_experts:
-        raise TypeError(f"factor must be float32 with {num_experts} entries, got {factor.dtype} {tuple(factor.shape)}")
-    if e4m3_lut.dtype != torch.float32 or e4m3_lut.numel() != 256:
-        raise TypeError("e4m3_lut must be the float32 (256,) e4m3 table")
+        msg = f"factor must be float32 with {num_experts} entries, got {factor.dtype} {tuple(factor.shape)}"
+        raise TypeError(msg)
+    if e4m3_lut.dtype != torch.float32 or e4m3_lut.numel() != E4M3_TABLE_SIZE:
+        msg = "e4m3_lut must be the float32 (256,) e4m3 table"
+        raise TypeError(msg)
     for name, t in (("expert_of_block", expert_of_block), ("block_row0", block_row0), ("block_rows", block_rows)):
         if t.dtype != torch.int32:
-            raise TypeError(f"{name} must be int32, got {t.dtype}")
+            msg = f"{name} must be int32, got {t.dtype}"
+            raise TypeError(msg)
     tensors = {
         "inp": inp,
         "codes": codes,
@@ -302,69 +321,84 @@ def nvfp4_grouped_gemm(
     }
     for name, t in tensors.items():
         _check_device(t, name, device)
-    if inp.dim() != 2:
-        raise ValueError(f"inp must be 2-D, got {tuple(inp.shape)}")
+    if inp.dim() != INP_NDIM:
+        msg = f"inp must be 2-D, got {tuple(inp.shape)}"
+        raise ValueError(msg)
 
-    assert columns % NVFP4_BLOCK == 0, f"C ({columns}) must be divisible by {NVFP4_BLOCK}"
+    assert columns % NVFP4_BLOCK == 0, f"C ({columns}) must be divisible by {NVFP4_BLOCK}"  # noqa: S101  # invariant check on tile sizes
     k_dim, n_dim = (rows, columns) if transpose else (columns, rows)
     if inp.shape[1] != k_dim:
-        raise ValueError(f"inp has {inp.shape[1]} columns, expected {k_dim} (transpose={transpose})")
-    assert n_dim % block_n == 0, f"N_dim ({n_dim}) must be divisible by block_n ({block_n})"
+        msg = f"inp has {inp.shape[1]} columns, expected {k_dim} (transpose={transpose})"
+        raise ValueError(msg)
+    assert n_dim % block_n == 0, f"N_dim ({n_dim}) must be divisible by block_n ({block_n})"  # noqa: S101  # invariant check on tile sizes
     if transpose:
-        assert block_n % NVFP4_BLOCK == 0, f"block_n ({block_n}) must be divisible by 16 for transpose=True"
-        assert rows % block_k == 0, f"R ({rows}) must be divisible by block_k ({block_k}) for transpose=True"
+        assert block_n % NVFP4_BLOCK == 0, f"block_n ({block_n}) must be divisible by 16 for transpose=True"  # noqa: S101  # invariant check on tile sizes
+        assert rows % block_k == 0, f"R ({rows}) must be divisible by block_k ({block_k}) for transpose=True"  # noqa: S101  # invariant check on tile sizes
     else:
-        assert block_k % NVFP4_BLOCK == 0, f"block_k ({block_k}) must be divisible by 16 for transpose=False"
-        assert columns % block_k == 0, f"C ({columns}) must be divisible by block_k ({block_k}) for transpose=False"
+        assert block_k % NVFP4_BLOCK == 0, f"block_k ({block_k}) must be divisible by 16 for transpose=False"  # noqa: S101  # invariant check on tile sizes
+        assert columns % block_k == 0, f"C ({columns}) must be divisible by block_k ({block_k}) for transpose=False"  # noqa: S101  # invariant check on tile sizes
 
     if act is None:
         if save_grads or dfac is not None:
-            raise ValueError("save_grads and dfac need act")
+            msg = "save_grads and dfac need act"
+            raise ValueError(msg)
     else:
         if transpose:
-            raise ValueError("act is only valid with transpose=False")
+            msg = "act is only valid with transpose=False"
+            raise ValueError(msg)
         if row_scale is not None:
-            raise ValueError("act does not combine with row_scale")
+            msg = "act does not combine with row_scale"
+            raise ValueError(msg)
         if out_dtype != inp.dtype:
-            raise TypeError(f"act needs out_dtype equal to the input dtype ({inp.dtype}), got {out_dtype}")
+            msg = f"act needs out_dtype equal to the input dtype ({inp.dtype}), got {out_dtype}"
+            raise TypeError(msg)
         if not round_out:
-            raise ValueError("act rounds the accumulator to the input dtype first; round_out=False is not supported")
+            msg = "act rounds the accumulator to the input dtype first; round_out=False is not supported"
+            raise ValueError(msg)
         if block_n % 2:
-            raise ValueError(f"act needs an even block_n (gate/up pairs), got {block_n}")
+            msg = f"act needs an even block_n (gate/up pairs), got {block_n}"
+            raise ValueError(msg)
         if dfac is not None and not save_grads:
-            raise ValueError("dfac needs save_grads")
+            msg = "dfac needs save_grads"
+            raise ValueError(msg)
     out_cols = n_dim // 2 if act is not None else n_dim
 
     num_plan_rows = inp.shape[0] if in_rows is None else in_rows.numel()
     options = (("in_rows", in_rows, torch.int32), ("out_rows", out_rows, torch.int32))
-    for name, t, dtype in options + (("row_scale", row_scale, torch.float32),):
+    for name, t, dtype in (*options, ("row_scale", row_scale, torch.float32)):
         if t is None:
             continue
         if t.dtype != dtype or t.dim() != 1 or t.numel() != num_plan_rows:
-            raise ValueError(f"{name} must be {dtype} ({num_plan_rows},), got {t.dtype} {tuple(t.shape)}")
+            msg = f"{name} must be {dtype} ({num_plan_rows},), got {t.dtype} {tuple(t.shape)}"
+            raise ValueError(msg)
         _check_device(t, name, device)
     if out_rows is None:
         if num_out_rows is not None:
-            raise ValueError("num_out_rows needs out_rows")
+            msg = "num_out_rows needs out_rows"
+            raise ValueError(msg)
         num_rows = num_plan_rows
     else:
         if num_out_rows is None:
-            raise ValueError("out_rows needs num_out_rows")
+            msg = "out_rows needs num_out_rows"
+            raise ValueError(msg)
         num_rows = num_out_rows
     if row_scale is not None and out_dtype != torch.float32:
-        raise TypeError("row_scale needs out_dtype=torch.float32")
+        msg = "row_scale needs out_dtype=torch.float32"
+        raise TypeError(msg)
     if out is None:
         out = torch.zeros(num_rows, out_cols, dtype=out_dtype, device=device)
     else:
         if out.dtype != out_dtype or tuple(out.shape) != (num_rows, out_cols):
-            raise ValueError(f"out must be {out_dtype} {(num_rows, out_cols)}, got {out.dtype} {tuple(out.shape)}")
+            msg = f"out must be {out_dtype} {(num_rows, out_cols)}, got {out.dtype} {tuple(out.shape)}"
+            raise ValueError(msg)
         _check_device(out, "out", device)
     if save_grads:
         if dfac is None:
             dfac = torch.zeros(num_rows, n_dim, dtype=out_dtype, device=device)
         else:
             if dfac.dtype != out_dtype or tuple(dfac.shape) != (num_rows, n_dim):
-                raise ValueError(f"dfac must be {out_dtype} {(num_rows, n_dim)}, got {dfac.dtype} {tuple(dfac.shape)}")
+                msg = f"dfac must be {out_dtype} {(num_rows, n_dim)}, got {dfac.dtype} {tuple(dfac.shape)}"
+                raise ValueError(msg)
             _check_device(dfac, "dfac", device)
 
     def result():
@@ -378,7 +412,7 @@ def nvfp4_grouped_gemm(
     widen = bool(round_out) and out_dtype == torch.float32
     round_acc_bf16 = inp.dtype == torch.bfloat16 and (act is not None or widen)
     dummy = block_rows  # stands in for unused pointer arguments; never read
-    _nvfp4_grouped_gemm_kernel[grid](
+    _nvfp4_grouped_gemm_kernel[grid](  # pyright: ignore[reportIndexIssue]  # triton's JIT launcher
         inp,
         codes,
         scale_u8,
@@ -423,7 +457,7 @@ class TritonBackend:
     ieee float32 dots, float32 output), the same semantics as ``TorchBackend`` for those dtypes.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917  # three tensors per projection, passed positionally
         self,
         gate_up_codes: torch.Tensor,
         gate_up_scale: torch.Tensor,
@@ -432,16 +466,18 @@ class TritonBackend:
         down_scale: torch.Tensor,
         down_factor: torch.Tensor,
     ) -> None:
+        """Wrap the packed NVFP4 codes, block scales and factors of both projections (no copies)."""
         self.weights: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         for proj, codes, scale, factor in (
             ("gate_up", gate_up_codes, gate_up_scale, gate_up_factor),
             ("down", down_codes, down_scale, down_factor),
         ):
             if not codes.is_contiguous() or not scale.is_contiguous():
-                raise ValueError(f"{proj} codes and scale must be contiguous (they are not copied)")
+                msg = f"{proj} codes and scale must be contiguous (they are not copied)"
+                raise ValueError(msg)
             scale_u8 = scale if scale.dtype == torch.uint8 else scale.view(torch.uint8)
-            factor = factor.to(device=codes.device, dtype=torch.float32).reshape(-1).contiguous()  # (E,), tiny
-            self.weights[proj] = (codes, scale_u8, factor)
+            factor_f32 = factor.to(device=codes.device, dtype=torch.float32).reshape(-1).contiguous()  # (E,), tiny
+            self.weights[proj] = (codes, scale_u8, factor_f32)
         self.num_experts = gate_up_codes.shape[0]
         self.e4m3_lut = e4m3_table(device=gate_up_codes.device)
         self.block_sizes: dict[tuple[str, bool], dict[str, int]] = {
@@ -450,11 +486,11 @@ class TritonBackend:
             for transpose in (False, True)
         }
 
-    def gemm(
+    def gemm(  # noqa: PLR0913  # keyword options of the backend protocol
         self,
         inp: torch.Tensor,
         proj: str,
-        transpose: bool,
+        transpose: bool,  # noqa: FBT001  # callers pass it positionally
         plan,
         *,
         in_rows: torch.Tensor | None = None,
@@ -466,9 +502,13 @@ class TritonBackend:
         act: tuple[float, float] | None = None,
         save_grads: bool = False,
     ):
-        """The backend protocol of ``inkling_kernels`` (keyword options in its module docstring). No host sync."""
+        """Implement the backend protocol of ``inkling_kernels`` (keyword options in its module docstring).
+
+        No host sync.
+        """
         if inp.dtype not in (torch.bfloat16, torch.float32):
-            raise TypeError(f"TritonBackend supports bfloat16 and float32 input, got {inp.dtype}")
+            msg = f"TritonBackend supports bfloat16 and float32 input, got {inp.dtype}"
+            raise TypeError(msg)
         out_dtype, _ = check_gemm_options(
             inp,
             plan,
@@ -478,18 +518,19 @@ class TritonBackend:
             row_scale,
             out_dtype,
             act,
-            save_grads,
-            proj,
-            transpose,
-            round_out,
+            save_grads=save_grads,
+            proj=proj,
+            transpose=transpose,
+            round_out=round_out,
         )
         codes, scale_u8, factor = self.weights[proj]
-        sizes = self.block_sizes[(proj, bool(transpose))]
+        sizes: dict[str, Any] = self.block_sizes[(proj, bool(transpose))]
         if plan.block_m > sizes["block_m"]:
-            raise ValueError(
+            msg = (
                 f"the plan was built with block_m {plan.block_m} but the kernel's block_m is {sizes['block_m']}; "
                 "build the plan with block_m <= the backend's block_m"
             )
+            raise ValueError(msg)
         return nvfp4_grouped_gemm(
             inp.contiguous(),
             codes,

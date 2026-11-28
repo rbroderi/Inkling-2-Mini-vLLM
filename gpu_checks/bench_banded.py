@@ -1,4 +1,6 @@
-"""Ticket A1 (docs/inkling_general_speed.md section 10): time and peak memory of the real model with the banded
+"""Time and peak memory of the real Inkling model with the banded sliding attention off and on.
+
+Ticket A1 (docs/inkling_general_speed.md section 10): time and peak memory of the real model with the banded
 sliding attention off and on, at T = 1,024, 2,048, 3,072 and 4,096 tokens (fused experts by default).
 
 Per length and setting: (a) one no-grad forward; (b) one training step with LoRA (r 16, ``INKLING_LORA_TARGETS``),
@@ -12,9 +14,7 @@ training step at least 5% faster with the patch). The card should otherwise be i
 Run in WSL (takes the GPU lock, needs 21 GiB free):
     cd /path/to/Inkling-2-Mini-vLLM && HF_HUB_OFFLINE=1 PYTHONPATH=. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         ~/inkling-venv/bin/python gpu_checks/bench_banded.py --out /tmp/bench_banded.json
-"""
-
-from __future__ import annotations
+"""  # run as scripts, not a package
 
 import argparse
 import gc
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812  # torch convention
 
 MODEL = "thinkingmachines/Inkling-2-Mini"
 LOSS_POSITIONS = 64
@@ -33,13 +33,14 @@ WARMUP, RUNS = 2, 5
 
 
 def last_positions_loss(base: Any, ids: torch.Tensor) -> torch.Tensor:
-    """Decoder on all positions, output layer and softcap on the last 64 (+1 shifted), next-token loss."""
+    """Return the next-token loss, applying the output layer and softcap only to the last 64 (+1 shifted) positions."""
     hidden = base.model(input_ids=ids, use_cache=False).last_hidden_state
     logits = base.logit_softcap(base.lm_head(hidden[:, -LOSS_POSITIONS - 1 : -1]).float())
     return F.cross_entropy(logits.flatten(0, 1), ids[:, -LOSS_POSITIONS:].flatten())
 
 
 def time_case(fn) -> dict[str, Any]:
+    """Time ``fn`` after warm-up runs; return the median time and peak memory, or an OOM result."""
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
@@ -65,7 +66,8 @@ def time_case(fn) -> dict[str, Any]:
     }
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901, PLR0915, PLR0912  # check script, one long flow
+    """Time the banded and original sliding attention at each length and print the table and gate."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--lengths", default="1024,2048,3072,4096")
     parser.add_argument("--modes", default="forward,train_step", help="comma-separated subset of forward,train_step")
@@ -81,14 +83,17 @@ def main() -> None:
     args = parser.parse_args()
     lengths = [int(x) for x in args.lengths.split(",")]
 
-    from peft import LoraConfig, get_peft_model
-    from transformers import AutoTokenizer
+    from peft import LoraConfig  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from peft import get_peft_model  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from transformers import AutoTokenizer  # noqa: PLC0415  # heavy GPU dependency, lazy
 
-    from gpu_checks.check_banded_attention import long_token_ids
-    from inkling_qlora import inkling as ik
-    from inkling_qlora import inkling_banded as ib
+    from gpu_checks.check_banded_attention import long_token_ids  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora import inkling as ik  # noqa: PLC0415  # heavy GPU dependency, lazy
+    from inkling_qlora import inkling_banded as ib  # noqa: PLC0415  # heavy GPU dependency, lazy
 
-    model = ik.load_inkling_4bit(MODEL, device="cuda", experts_impl=args.experts_impl, mxfp8_storage=args.mxfp8_storage)
+    model: Any = ik.load_inkling_4bit(
+        MODEL, device="cuda", experts_impl=args.experts_impl, mxfp8_storage=args.mxfp8_storage
+    )
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
     model = get_peft_model(
@@ -128,19 +133,19 @@ def main() -> None:
                 shown = r.get("result") or f"{r['median_s']:.3f}s median, peak {r['peak_gib']:.2f} GiB"
                 print(f"T={length:5d} {mode:10s} banded={banded!s:5s} {shown}", flush=True)
 
-    def get(length: int, mode: str, banded: bool) -> dict[str, Any] | None:
+    def get(length: int, mode: str, *, banded: bool) -> dict[str, Any] | None:
         return next((r for r in results if (r["length"], r["mode"], r["banded"]) == (length, mode, banded)), None)
 
     print("\nlength  mode        off (s)   on (s)   speed-up   peak off / on (GiB)")
     speedups: dict[tuple[int, str], float | None] = {}
     for length in lengths:
         for mode in ("forward", "train_step"):
-            off, on = get(length, mode, False), get(length, mode, True)
+            off, on = get(length, mode, banded=False), get(length, mode, banded=True)
             if off is None or on is None or "median_s" not in off or "median_s" not in on:
                 speedups[(length, mode)] = None
-                print(
-                    f"{length:6d}  {mode:10s}  {off.get('result', '') if off else ''} / {on.get('result', '') if on else ''}"
-                )
+                off_result = off.get("result", "") if off else ""
+                on_result = on.get("result", "") if on else ""
+                print(f"{length:6d}  {mode:10s}  {off_result} / {on_result}")
                 continue
             s = 1 - on["median_s"] / off["median_s"]  # time saved by the patch
             speedups[(length, mode)] = s
