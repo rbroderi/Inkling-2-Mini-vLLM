@@ -10,8 +10,6 @@ the target modules and the scaling alpha / r, which the merge keeps (alpha = sca
 (agent config, tokenizer, chat template) are copied from the first source.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import shutil
@@ -25,10 +23,12 @@ COPY = ("agent_config.json", "tokenizer.json", "tokenizer_config.json", "chat_te
 
 
 def merge(sources: list[dict[str, torch.Tensor]], weights: list[float]) -> dict[str, torch.Tensor]:
+    """Concatenate the sources' LoRA matrices along the rank axis, scaling each B by its weight."""
     keys = set(sources[0])
     for s in sources[1:]:
         if set(s) != keys:
-            raise SystemExit(f"adapters target different modules: {sorted(keys ^ set(s))[:4]}")
+            msg = f"adapters target different modules: {sorted(keys ^ set(s))[:4]}"
+            raise SystemExit(msg)
     out: dict[str, torch.Tensor] = {}
     for k in sorted(keys):
         if ".lora_A." in k:
@@ -36,11 +36,13 @@ def merge(sources: list[dict[str, torch.Tensor]], weights: list[float]) -> dict[
         elif ".lora_B." in k:
             out[k] = torch.cat([w * s[k] for s, w in zip(sources, weights, strict=True)], dim=1)
         else:
-            raise SystemExit(f"unexpected tensor {k} (only lora_A / lora_B are merged)")
+            msg = f"unexpected tensor {k} (only lora_A / lora_B are merged)"
+            raise SystemExit(msg)
     return out
 
 
 def main() -> None:
+    """Merge the adapters named on the command line into one adapter folder."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out", type=Path)
     ap.add_argument("sources", type=Path, nargs="+")
@@ -48,15 +50,18 @@ def main() -> None:
     args = ap.parse_args()
     weights = args.weights or [1 / len(args.sources)] * len(args.sources)
     if len(weights) != len(args.sources):
-        raise SystemExit("one weight per source")
+        msg = "one weight per source"
+        raise SystemExit(msg)
 
     cfgs = [json.loads((s / "adapter_config.json").read_text()) for s in args.sources]
     scales = {c["lora_alpha"] / c["r"] for c in cfgs}
     if len(scales) != 1 or any(c.get("rank_pattern") or c.get("alpha_pattern") for c in cfgs):
-        raise SystemExit(f"sources need one alpha / r and no rank/alpha patterns (got {scales})")
+        msg = f"sources need one alpha / r and no rank/alpha patterns (got {scales})"
+        raise SystemExit(msg)
     targets = {json.dumps(c["target_modules"], sort_keys=True) for c in cfgs}
     if len(targets) != 1:
-        raise SystemExit("sources have different target_modules")
+        msg = "sources have different target_modules"
+        raise SystemExit(msg)
 
     tensors = merge([load_file(str(s / "adapter_model.safetensors")) for s in args.sources], weights)
     rank = sum(c["r"] for c in cfgs)

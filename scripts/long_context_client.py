@@ -1,5 +1,8 @@
-"""Client of long_context_probe.sh: one synthetic ~90% prompt against a running server. Prints one tab-separated line:
-prefill_s, prompt_tokens, decode_tok_s, needle (pass|fail). Needs only the standard library."""
+"""Client of long_context_probe.sh: one synthetic ~90% prompt against a running server.
+
+Prints one tab-separated line: prefill_s, prompt_tokens, decode_tok_s, needle (pass|fail). Needs only the standard
+library.
+"""
 
 import argparse
 import json
@@ -16,17 +19,23 @@ CODE = "7391-AQUA-4408"
 
 
 def post(path, body, timeout=3600):
-    req = urllib.request.Request(base + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
-    return urllib.request.urlopen(req, timeout=timeout)
+    """POST a JSON body to the local server and return the open response."""
+    req = urllib.request.Request(base + path, json.dumps(body).encode(), {"Content-Type": "application/json"})  # noqa: S310  # local http server
+    return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310  # local http server
 
 
 def ntok(text):
+    """Return the number of tokens the server counts in ``text``."""
     body = {"model": "inkling-2-mini", "prompt": text, "add_special_tokens": False}
     return len(json.load(post("/tokenize", body))["tokens"])
 
 
 def sentence(i):
-    return f"Note {i}: shelf {i % 97} of archive {i % 13} holds item {(i * 7919) % 10007} and was checked on day {i % 365}.\n"
+    """Return the i-th filler sentence."""
+    return (
+        f"Note {i}: shelf {i % 97} of archive {i % 13} holds item {(i * 7919) % 10007} "
+        f"and was checked on day {i % 365}.\n"
+    )
 
 
 target = int(a.length * 0.9) - 200
@@ -41,6 +50,7 @@ chat = {"model": "inkling-2-mini", "temperature": 0, "chat_template_kwargs": {"r
 
 
 def msg(tail):
+    """Return the chat messages: the haystack followed by ``tail``."""
     return [{"role": "user", "content": haystack + tail}]
 
 

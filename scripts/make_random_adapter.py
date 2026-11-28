@@ -3,8 +3,6 @@
 Every module's update (alpha / r) * B @ A has norm rel_norm * ||W||_F, W being the base weight it adapts.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import re
@@ -24,27 +22,30 @@ from inkling_qlora.inkling_vllm_adapter import NUM_LAYERS
 DEFAULT_MODULES = "q_proj.linear,k_proj.linear,v_proj.linear,o_proj.linear,o_proj.gate_proj"
 
 
-def scaled_pair(W: torch.Tensor, r: int, alpha: float, rel_norm: float, gen: torch.Generator):
-    """A (r, in) and B (out, r), float32, with ||(alpha / r) B A||_F = rel_norm * ||W||_F."""
-    out, inp = W.shape
-    A = torch.randn(r, inp, generator=gen, dtype=torch.float32)
-    B = torch.randn(out, r, generator=gen, dtype=torch.float32)
-    delta = (alpha / r) * (B.double() @ A.double())
-    B = B * float(rel_norm * W.double().norm() / delta.norm())
-    return A, B
+def scaled_pair(weight: torch.Tensor, r: int, alpha: float, rel_norm: float, gen: torch.Generator):
+    """Return A (r, in) and B (out, r), float32, with ||(alpha / r) B A||_F = rel_norm * ||weight||_F."""
+    out, inp = weight.shape
+    a_mat = torch.randn(r, inp, generator=gen, dtype=torch.float32)
+    b_mat = torch.randn(out, r, generator=gen, dtype=torch.float32)
+    delta = (alpha / r) * (b_mat.double() @ a_mat.double())
+    b_mat = b_mat * float(rel_norm * weight.double().norm() / delta.norm())
+    return a_mat, b_mat
 
 
 def find_snapshot() -> Path:
-    from huggingface_hub.constants import HF_HUB_CACHE
+    """Return the newest cached snapshot of the base model that has a weight index."""
+    from huggingface_hub.constants import HF_HUB_CACHE  # noqa: PLC0415  # optional heavy dependency
 
     repo = Path(HF_HUB_CACHE) / f"models--{BASE_MODEL.replace('/', '--')}" / "snapshots"
     found = sorted(p for p in repo.glob("*") if (p / "model.safetensors.index.json").exists()) if repo.exists() else []
     if not found:
-        raise FileNotFoundError(f"no cached snapshot of {BASE_MODEL} with model.safetensors.index.json under {repo}")
+        msg = f"no cached snapshot of {BASE_MODEL} with model.safetensors.index.json under {repo}"
+        raise FileNotFoundError(msg)
     return found[-1]
 
 
 def main() -> None:
+    """Write the random adapter to the output folder."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("out_dir", type=Path)
     ap.add_argument("--seed", type=int, default=0)
@@ -57,7 +58,8 @@ def main() -> None:
     modules = args.modules.split(",")
     unknown = [m for m in modules if m not in MODULE_MAP]
     if unknown:
-        raise SystemExit(f"unknown modules: {unknown}")
+        msg = f"unknown modules: {unknown}"
+        raise SystemExit(msg)
     snap = args.snapshot or find_snapshot()
     wmap = json.loads((snap / "model.safetensors.index.json").read_text())["weight_map"]
     names = list(MODULE_MAP)
@@ -66,12 +68,12 @@ def main() -> None:
         for hf in modules:
             wname = f"model.llm.layers.{layer}.attn.{MODULE_MAP[hf]}.weight"
             with safe_open(str(snap / wmap[wname]), framework="pt", device="cpu") as f:
-                W = f.get_tensor(wname)
+                weight = f.get_tensor(wname)
             gen = torch.Generator().manual_seed(args.seed * 1000003 + layer * 101 + names.index(hf))
-            A, B = scaled_pair(W, args.r, args.alpha, args.rel_norm, gen)
+            a_mat, b_mat = scaled_pair(weight, args.r, args.alpha, args.rel_norm, gen)
             base = f"base_model.model.model.language_model.layers.{layer}.self_attn.{hf}"
-            tensors[f"{base}.lora_A.weight"] = A
-            tensors[f"{base}.lora_B.weight"] = B
+            tensors[f"{base}.lora_A.weight"] = a_mat
+            tensors[f"{base}.lora_B.weight"] = b_mat
     args.out_dir.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(args.out_dir / "adapter_model.safetensors"), metadata={"format": "pt"})
     regex = r".*language_model\..*\.(?:" + "|".join(re.escape(m) for m in modules) + ")"

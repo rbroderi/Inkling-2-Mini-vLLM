@@ -1,3 +1,5 @@
+"""Tests for merge adapters cat."""
+
 import importlib.util
 import json
 import sys
@@ -11,6 +13,8 @@ from safetensors.torch import save_file
 _spec = importlib.util.spec_from_file_location(
     "merge_adapters_cat", Path(__file__).resolve().parents[1] / "scripts" / "merge_adapters_cat.py"
 )
+assert _spec is not None
+assert _spec.loader is not None
 mac = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mac)
 
@@ -27,6 +31,7 @@ def _adapter(path: Path, seed: int, r: int = 4, alpha: int = 8) -> dict:
 
 
 def test_cat_merge_equals_weighted_sum_of_deltas(tmp_path, monkeypatch):
+    """Check cat merge equals weighted sum of deltas."""
     a, b = _adapter(tmp_path / "a", 0), _adapter(tmp_path / "b", 1)
     out = tmp_path / "m"
     monkeypatch.setattr(
@@ -35,7 +40,8 @@ def test_cat_merge_equals_weighted_sum_of_deltas(tmp_path, monkeypatch):
     mac.main()
     m = load_file(str(out / "adapter_model.safetensors"))
     cfg = json.loads((out / "adapter_config.json").read_text())
-    assert cfg["r"] == 8 and cfg["lora_alpha"] == 16  # scaling alpha / r stays 2
+    assert cfg["r"] == 8
+    assert cfg["lora_alpha"] == 16
 
     def delta(t, scale):
         return scale * t[f"{K}.lora_B.weight"] @ t[f"{K}.lora_A.weight"]
@@ -45,6 +51,7 @@ def test_cat_merge_equals_weighted_sum_of_deltas(tmp_path, monkeypatch):
 
 
 def test_mismatched_scaling_is_refused(tmp_path, monkeypatch):
+    """Check mismatched scaling is refused."""
     _adapter(tmp_path / "a", 0, r=4, alpha=8)
     _adapter(tmp_path / "b", 1, r=4, alpha=4)
     monkeypatch.setattr(sys, "argv", ["x", str(tmp_path / "m"), str(tmp_path / "a"), str(tmp_path / "b")])

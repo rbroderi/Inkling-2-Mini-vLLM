@@ -1,7 +1,5 @@
 """Convert a PEFT Inkling adapter directory to vLLM's checkpoint names: convert_adapter.py SRC DST."""
 
-from __future__ import annotations
-
 import argparse
 import json
 import sys
@@ -13,6 +11,7 @@ from inkling_qlora.inkling_vllm_adapter import convert_adapter
 
 
 def main() -> None:
+    """Convert a PEFT adapter to the vLLM layout and print the summary."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("src", type=Path)
     ap.add_argument("dst", type=Path)
