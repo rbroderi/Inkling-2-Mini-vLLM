@@ -1,5 +1,10 @@
+"""Tests for bucketing."""
+
+import itertools
 import random
 import statistics
+from typing import Any
+from typing import cast
 
 import numpy as np
 import pytest
@@ -10,13 +15,15 @@ from inkling_qlora.bucketing import padding_ratio
 
 
 def lognormal(n=4000, seed=1):
-    rng = random.Random(seed)
+    """Return ``n`` log-normal sequence lengths around 524."""
+    rng = random.Random(seed)  # noqa: S311  # test data, not cryptography
     sigma = 0.5
     mu = np.log(524) - sigma**2 / 2
     return [max(8, int(rng.lognormvariate(mu, sigma))) for _ in range(n)]
 
 
 def test_each_index_once_epochs_differ_and_reproduce():
+    """Check each index once epochs differ and reproduce."""
     lengths = lognormal(500)
     s = BucketedSampler(lengths, 2, seed=3)
     e0 = list(s)
@@ -33,19 +40,21 @@ def test_each_index_once_epochs_differ_and_reproduce():
 
 
 def test_set_epoch_resume_and_dataloader_epochs():
+    """Check set epoch resume and dataloader epochs."""
     lengths = lognormal(203)
     ref = BucketedSampler(lengths, 4, seed=7)
     fresh = BucketedSampler(lengths, 4, seed=7)
     fresh.set_epoch(1)
     assert list(fresh) == [i for b in ref.batches(1) for i in b]
     assert list(fresh) == list(fresh)
-    dl = DataLoader(list(range(203)), batch_size=4, sampler=ref)
+    dl = DataLoader(cast("Any", list(range(203))), batch_size=4, sampler=ref)
     for e in (0, 1):
         ref.set_epoch(e)
         assert [b.tolist() for b in dl] == ref.batches(e)
 
 
 def test_no_global_random_dependence():
+    """Check no global random dependence."""
     lengths = lognormal(300)
     random.seed(1)
     a = list(BucketedSampler(lengths, 4))
@@ -53,24 +62,26 @@ def test_no_global_random_dependence():
     assert a == list(BucketedSampler(lengths, 4))
 
 
-@pytest.mark.parametrize("n,bs,w", [(103, 4, 3), (100, 2, 5), (7, 3, 32), (64, 2, 32)])
+@pytest.mark.parametrize(("n", "bs", "w"), [(103, 4, 3), (100, 2, 5), (7, 3, 32), (64, 2, 32)])
 def test_dataloader_batches_match(n, bs, w):
+    """Check dataloader batches match."""
     lengths = lognormal(n, seed=n)
     s = BucketedSampler(lengths, bs, window_batches=w, seed=5)
     expected = s.batches(0)
-    got = [b.tolist() for b in DataLoader(list(range(n)), batch_size=bs, sampler=s, drop_last=False)]
+    got = [b.tolist() for b in DataLoader(cast("Any", list(range(n))), batch_size=bs, sampler=s, drop_last=False)]
     assert got == expected
     assert all(len(b) == bs for b in got[:-1])
 
 
 def test_short_batch_last_and_batches_shuffled():
+    """Check short batch last and batches shuffled."""
     lengths = lognormal(1000)
     batches = BucketedSampler(lengths, 3, window_batches=4).batches(0)
     assert len(batches[-1]) == 1000 % 3
     assert all(len(b) == 3 for b in batches[:-1])
     means = [statistics.mean(lengths[i] for i in b) for b in batches[:-1]]
     # without the shuffle, batches within a window ascend, so most adjacent pairs would rise
-    rises = sum(b > a for a, b in zip(means, means[1:], strict=False))
+    rises = sum(b > a for a, b in itertools.pairwise(means))
     assert 0.35 < rises / (len(means) - 1) < 0.65
     # within a batch lengths are sorted (bucketed), not by index
     assert all(lengths[b[0]] <= lengths[b[-1]] for b in batches[:-1])
@@ -78,28 +89,34 @@ def test_short_batch_last_and_batches_shuffled():
 
 
 def test_batch_size_one_is_permutation():
+    """Check batch size one is permutation."""
     s = BucketedSampler(list(range(50)), 1, seed=2)
     a = list(s)
     s.set_epoch(1)
     b = list(s)
-    assert sorted(a) == list(range(50)) and a != b and a != list(range(50))
+    assert sorted(a) == list(range(50))
+    assert a != b
+    assert a != list(range(50))
 
 
 def test_padding_ratio_values():
+    """Check padding ratio values."""
     assert padding_ratio([10, 10, 20, 20], [0, 1, 2, 3], 2) == 1.0
     assert padding_ratio([10, 20, 10, 20], [0, 1, 2, 3], 2) == pytest.approx(80 / 60)
 
 
 def test_padding_on_lognormal():
+    """Check padding on lognormal."""
     lengths = lognormal()
     order = list(BucketedSampler(lengths, 2, seed=0))
     assert padding_ratio(lengths, order, 2) <= 1.03
     rand = list(range(len(lengths)))
-    random.Random(0).shuffle(rand)
+    random.Random(0).shuffle(rand)  # noqa: S311  # test data, not cryptography
     assert padding_ratio(lengths, rand, 2) >= 1.08
 
 
 def test_updates_not_length_sorted():
+    """Check updates not length sorted."""
     lengths = lognormal()
     s = BucketedSampler(lengths, 2, seed=0)
     batches = s.batches(0)[:-1]

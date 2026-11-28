@@ -1,7 +1,5 @@
 """Length-bucketed sampler: low padding without coupling updates to length."""
 
-from __future__ import annotations
-
 import random
 from collections.abc import Iterator
 from collections.abc import Sequence
@@ -21,8 +19,10 @@ class BucketedSampler(Sampler[int]):
     """
 
     def __init__(self, lengths: Sequence[int], batch_size: int, window_batches: int = 32, seed: int = 0):
+        """Create a sampler over examples with the given token ``lengths``."""
         if batch_size < 1 or window_batches < 1:
-            raise ValueError("batch_size and window_batches must be at least 1")
+            msg = "batch_size and window_batches must be at least 1"
+            raise ValueError(msg)
         self.lengths = list(lengths)
         self.batch_size = batch_size
         self.window_batches = window_batches
@@ -30,13 +30,12 @@ class BucketedSampler(Sampler[int]):
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
+        """Set the epoch that seeds the order of the next pass."""
         self.epoch = epoch
 
-    def __len__(self) -> int:
-        return len(self.lengths)
-
     def batches(self, epoch: int) -> list[list[int]]:
-        rng = random.Random(self.seed * 1_000_003 + epoch)
+        """Return the batches (lists of indices) for ``epoch``."""
+        rng = random.Random(self.seed * 1_000_003 + epoch)  # noqa: S311  # shuffling, not cryptography
         order = list(range(len(self.lengths)))
         rng.shuffle(order)
         if self.batch_size == 1:
@@ -56,12 +55,17 @@ class BucketedSampler(Sampler[int]):
         return full + ([short] if short else [])
 
     def __iter__(self) -> Iterator[int]:
+        """Yield all indices in this epoch's batch order."""
         for batch in self.batches(self.epoch):
             yield from batch
 
+    def __len__(self) -> int:
+        """Return the number of examples."""
+        return len(self.lengths)
+
 
 def padding_ratio(lengths: Sequence[int], order: Sequence[int], batch_size: int) -> float:
-    """Padded tokens over real tokens when ``order`` is cut into batches of ``batch_size``."""
+    """Return padded tokens over real tokens when ``order`` is cut into batches of ``batch_size``."""
     padded = real = 0
     for s in range(0, len(order), batch_size):
         ls = [lengths[i] for i in order[s : s + batch_size]]
